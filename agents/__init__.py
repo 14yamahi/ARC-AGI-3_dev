@@ -28,7 +28,7 @@ for rec in Recorder.list():
     AVAILABLE_AGENTS[rec] = Playback
 
 # update the agent dictionary to include subclasses of LLM class
-AVAILABLE_AGENTS["reasoningagent"] = ReasoningAgent
+# AVAILABLE_AGENTS["reasoningagent"] = ReasoningAgent
 AVAILABLE_AGENTS["myagent"] = MyAgent
 AVAILABLE_AGENTS["myagent2"] = MyAgent2
 
