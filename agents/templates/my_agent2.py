@@ -873,6 +873,37 @@ def choose_exploration_action(
     )
 
     return action
+
+def track_controlled_entity(
+    self,
+    transition,
+):
+    if not self.controlled_component_ids:
+        return
+
+    expected_delta = self.action_vectors.get(
+        self.previous_action
+    )
+
+    if expected_delta is None:
+        return
+
+    current_ids = set()
+
+    for movement in transition.moved_objects:
+
+        if (
+            movement.before.id
+            in self.controlled_component_ids
+            and movement.delta == expected_delta
+        ):
+            current_ids.add(
+                movement.after.id
+            )
+
+    if current_ids:
+        self.controlled_component_ids = current_ids
+
 # formatting response
 GOAL_RESULT = {
     "type": "object",
@@ -1403,11 +1434,15 @@ class MyAgent2(Agent):
                 self.previous_action,
                 objects,
             )
-
-            self.learn(
-                self.previous_action,
-                transition,
-            )
+            if self.mode == "DISCOVER":
+                self.learn(
+                    self.previous_action,
+                    transition,
+                )
+            else:
+                self.track_controlled_entity(
+                    transition,
+                )
 
             self.learn_traversable_colors(
                 self.previous_frame,
