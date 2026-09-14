@@ -10,20 +10,17 @@ from openai import OpenAI
 from PIL import Image
 
 # used for local runs w/ gpt API
-# from agents.agent import Agent
-# from arcengine import FrameData, GameAction, GameState
+from agents.agent import Agent
+from arcengine import FrameData, GameAction, GameState
 
 # used for Kaggle notebook runs
-import asyncio
-from dataclasses import dataclass
-from collections import deque, defaultdict
-from typing import Any
-import arcengine
-import numpy as np
-import taaf.game
-from taaf.solver import Solver
-import httpx
-import hashlib
+# import asyncio
+# from dataclasses import dataclass
+# from collections import deque, defaultdict
+# from typing import Any
+# import arcengine
+# import taaf.game
+# from taaf.solver import Solver
 
 # Should be already called in Kaggle 
 # LOCAL_BASE_URL = os.getenv(
@@ -40,19 +37,11 @@ import hashlib
 class GameObject:
     id: int
     color: int
-    pixels: set[tuple[int, int]]
-
-    bbox: tuple[int, int, int, int]
-    center: tuple[float, float]
-
-    shape_hash: str
-    boundary: list[tuple[int, int]]
-    children: list[int]
-
-@dataclass
-class Segmentation:
-    objects: list[GameObject]
-    adjacency: list[tuple[int, int]]
+    bbox: tuple
+    center: tuple
+    pixels: set
+    width: int
+    height: int
 
 @dataclass
 class Movement:
@@ -85,7 +74,7 @@ class SceneModel:
 
 @dataclass
 class ActionPrediction:
-    action: arcengine.GameAction
+    action: GameAction
 
     expected_delta: tuple
     collision_probability: float
@@ -106,37 +95,10 @@ class CompositeRegion:
     container_id: int
     content_ids: list[int]
 
-LOCAL_BASE_URL = (
-    os.getenv("LOCAL_ANALYZER_BASE_URL")
-    or os.getenv("OPENAI_BASE_URL")
-    or "http://127.0.0.1:1234/v1"
-)
-
-LOCAL_MODEL = (
-    os.getenv("INFERENCE_ANALYZER_MODEL")
-    or os.getenv("LOCAL_ANALYZER_MODEL_ID")
-    or "vrfai/Qwen3.6-27B-FP8"
-)
-
-LOCAL_API_KEY = (
-    os.getenv("LOCAL_ANALYZER_API_KEY")
-    or os.getenv("OPENAI_API_KEY")
-    or "local"
-)
-
-http_client = httpx.Client(
-    trust_env=False,
-)
-
-print("MY AGENT BASE URL:", LOCAL_BASE_URL)
-print("MY AGENT MODEL:", LOCAL_MODEL)
-
 client = OpenAI(
     base_url=LOCAL_BASE_URL,
-    api_key=LOCAL_API_KEY,
-    http_client=http_client,
+    api_key="local",
 )
-
 # convert ARC frame to png
 ARC_PALETTE = {
     0:  (255, 255, 255),  # white
@@ -156,25 +118,6 @@ ARC_PALETTE = {
     14: (79, 204, 48),    # green
     15: (163, 86, 214),   # purple
 }
-ARC_COLOR_NAMES = {
-    0: "white",
-    1: "light_gray",
-    2: "gray",
-    3: "dark_gray",
-    4: "very_dark_gray",
-    5: "black",
-    6: "magenta",
-    7: "pink",
-    8: "red",
-    9: "blue",
-    10: "cyan",
-    11: "yellow",
-    12: "orange",
-    13: "maroon",
-    14: "green",
-    15: "purple",
-}
-
 def frame_to_data_url(
     frame,
     save_path=None
@@ -195,10 +138,10 @@ def frame_to_data_url(
 
     # ARC grids are tiny.
     # Upscale without smoothing.
-    # image = image.resize(
-    #     (w * 8, h * 8),
-    #     Image.Resampling.NEAREST,
-    # )
+    image = image.resize(
+        (w * 8, h * 8),
+        Image.Resampling.NEAREST,
+    )
 
     buffer = io.BytesIO()
 
@@ -220,48 +163,11 @@ def frame_to_data_url(
         + encoded
     )
 # detect and extract objects to GameObject
-
-def object_hash(
-    pixels: set[tuple[int, int]],
-    color: int,
-) -> str:
-
-    min_y = min(y for y, x in pixels)
-    min_x = min(x for y, x in pixels)
-
-    normalized = sorted(
-        (y - min_y, x - min_x)
-        for y, x in pixels
-    )
-
-    payload = repr(
-        (color, normalized)
-    ).encode()
-
-    return hashlib.sha1(
-        payload
-    ).hexdigest()[:16]
-
-def group_objects_by_hash(objects: list[GameObject],):
-    groups = defaultdict(list)
-
-    for obj in objects:
-        groups[obj.shape_hash].append(
-            obj.id
-        )
-
-    return {
-        shape_hash: ids
-        for shape_hash, ids
-        in groups.items()
-        if len(ids) >= 2
-    }
-
 def extract_objects(frame) -> list[GameObject]:
     frame = np.asarray(frame)
 
     # You may need to change this depending on ARC-AGI-3 frames.
-    # background = 4
+    background = 4
 
     height, width = frame.shape
     visited = set()
@@ -284,8 +190,8 @@ def extract_objects(frame) -> list[GameObject]:
 
             color = int(frame[y, x])
 
-            # if color == background:
-            #     continue
+            if color == background:
+                continue
 
             queue = deque([(y, x)])
             visited.add((y, x))
@@ -318,14 +224,17 @@ def extract_objects(frame) -> list[GameObject]:
             min_y, max_y = min(ys), max(ys)
             min_x, max_x = min(xs), max(xs)
 
-            obj = GameObject(id=object_id,color=color,pixels=pixels,
-                bbox=(min_y,min_x,max_y,max_x,),
-                center=(sum(ys)/len(ys),sum(xs)/len(xs),),
-                shape_hash=object_hash(pixels,color,),
-                # Temporary until we implement
-                # Duck-style contour/enclosure.
-                boundary=[],
-                children=[],
+            obj = GameObject(
+                id=object_id,
+                color=color,
+                bbox=(min_y, min_x, max_y, max_x),
+                center=(
+                    sum(ys) / len(ys),
+                    sum(xs) / len(xs),
+                ),
+                pixels=pixels,
+                width=max_x - min_x + 1,
+                height=max_y - min_y + 1,
             )
 
             objects.append(obj)
@@ -356,7 +265,13 @@ def match_objects(before, after):
         for i in unmatched_after:
             new = after[i]
 
-            if old.shape_hash != new.shape_hash:
+            if old.color != new.color:
+                continue
+
+            if old.width != new.width:
+                continue
+
+            if old.height != new.height:
                 continue
 
             distance = (
@@ -364,13 +279,18 @@ def match_objects(before, after):
                 + abs(old.center[1] - new.center[1])
             )
 
-            candidates.append((distance, i, new))
+            candidates.append(
+                (distance, i, new)
+            )
 
         if not candidates:
             matches.append((old, None))
             continue
 
-        distance, i, new = min(candidates,key=lambda x: x[0],)
+        distance, i, new = min(
+            candidates,
+            key=lambda x: x[0],
+        )
 
         if distance > MAX_MATCH_DISTANCE:
             matches.append((old, None))
@@ -966,170 +886,35 @@ def choose_exploration_action(
 
     return action
 
-ARC_COLOR_CHARS = ("WwgGcBMPRbSYOrNp")
-def frame_crop_ascii(
-    frame,
-    min_row,
-    min_col,
-    max_row,
-    max_col,
+def track_controlled_entity(
+    self,
+    transition,
 ):
-    frame = np.asarray(frame)
+    if not self.controlled_component_ids:
+        return
 
-    min_row = max(
-        0,
-        int(min_row),
-    )
-    min_col = max(
-        0,
-        int(min_col),
+    expected_delta = self.action_vectors.get(
+        self.previous_action
     )
 
-    max_row = min(
-        frame.shape[0] - 1,
-        int(max_row),
-    )
-    max_col = min(
-        frame.shape[1] - 1,
-        int(max_col),
-    )
+    if expected_delta is None:
+        return
 
-    lines = []
+    current_ids = set()
 
-    for row in range(
-        min_row,
-        max_row + 1,
-    ):
-        line = "".join(
-            ARC_COLOR_CHARS[
-                int(frame[row, col])
-            ]
-            for col in range(
-                min_col,
-                max_col + 1,
+    for movement in transition.moved_objects:
+
+        if (
+            movement.before.id
+            in self.controlled_component_ids
+            and movement.delta == expected_delta
+        ):
+            current_ids.add(
+                movement.after.id
             )
-        )
 
-        lines.append(line)
-
-    return {
-        "rows": [
-            min_row,
-            max_row,
-        ],
-        "cols": [
-            min_col,
-            max_col,
-        ],
-        "ascii": "\n".join(lines),
-    }
-
-def inspect_scene(
-    args,
-    frame,
-    objects,
-    controlled_components,
-    action_vectors,
-    traversable_color_evidence,
-):
-    query = args["query"]
-
-    if query == "summary":
-        return {
-            "shape": list(frame.shape),
-            "component_count": len(objects),
-            "controlled_ids": sorted(
-                controlled_components
-            ),
-            "action_vectors": {
-                action.name: list(delta)
-                for action, delta
-                in action_vectors.items()
-            },
-            "traversable_colors": dict(
-                traversable_color_evidence
-            ),
-        }
-
-    if query == "controlled":
-        return [
-            {
-                "id": obj.id,
-                "color": ARC_COLOR_NAMES[
-                    obj.color
-                ],
-                "pixels": len(obj.pixels),
-                "bbox": list(obj.bbox),
-                "shape_hash": obj.shape_hash,
-            }
-            for obj in objects
-            if obj.id in controlled_components
-        ]
-
-    # if query == "component":
-    #     object_id = args["object_id"]
-
-    #     obj = next(
-    #         (obj for obj in objects if obj.id == object_id),
-    #         None,
-    #     )
-
-    #     if obj is None:
-    #         return {
-    #             "error": "unknown object id"
-    #         }
-
-    #     return {
-    #         "id": obj.id,
-    #         "color": ARC_COLOR_NAMES[
-    #             obj.color
-    #         ],
-    #         "pixels": len(obj.pixels),
-    #         "bbox": list(obj.bbox),
-    #         "center": list(obj.center),
-    #         "shape_hash": obj.shape_hash,
-    #     }
-    if query == "component":
-        ids = set(args.get("object_ids",[],))
-
-        return [
-            {
-                "id": obj.id,
-                "color": (
-                    ARC_COLOR_NAMES[
-                        obj.color
-                    ]
-                ),
-                "pixels": len(obj.pixels),
-                "bbox": list(obj.bbox),
-                "center": list(obj.center),
-                "shape_hash": obj.shape_hash,
-            }
-            for obj in objects
-            if obj.id in ids
-        ]
-    if query == "repeated_shapes":
-        return group_objects_by_hash(
-            objects
-        )
-
-    if query == "crop":
-        r1 = args["min_row"]
-        c1 = args["min_col"]
-        r2 = args["max_row"]
-        c2 = args["max_col"]
-
-        return frame_crop_ascii(
-            frame,
-            r1,
-            c1,
-            r2,
-            c2,
-        )
-
-    return {
-        "error": f"unknown query {query}"
-    }
+    if current_ids:
+        self.controlled_component_ids = current_ids
 
 # formatting response
 GOAL_RESULT = {
@@ -1198,54 +983,6 @@ SCENE_SCHEMA = {
     ],
     "additionalProperties": False,
 }
-INSPECT_SCENE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "query": {
-            "type": "string",
-            "enum": [
-                "summary",
-                "component",
-                "repeated_shapes",
-                "controlled",
-                "crop",
-            ],
-        },
-        # "object_id": {"type": "integer",},
-        "object_ids": {"type": "array","items": {"type": "integer"},},
-        "min_row": {"type": "integer",},
-        "min_col": {"type": "integer",},
-        "max_row": {"type": "integer",},
-        "max_col": {"type": "integer",},
-    },
-    "required": ["query"],
-    "additionalProperties": False,
-}
-SCENE_TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "inspect_scene",
-            "description": (
-                "Inspect deterministic structural information "
-                "about the current ARC scene. Use this instead "
-                "of guessing object relationships from the image."
-            ),
-            "parameters": INSPECT_SCENE_SCHEMA,
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "submit_scene_analysis",
-            "description": (
-                "Submit the final scene interpretation when "
-                "you have enough evidence."
-            ),
-            "parameters": SCENE_SCHEMA,
-        },
-    },
-]
 
 def analyze_scene_vlm(
     frame,
@@ -1254,218 +991,329 @@ def analyze_scene_vlm(
     controlled_components,
     traversable_color_evidence,
 ):
-    image_url = frame_to_data_url(frame)
+    image_url = frame_to_data_url(frame, save_path="debug_frames/debug_scene.png",)
 
-    verified_facts = {
-        "controlled_ids": sorted(
-            controlled_components
-        ),
-        "action_vectors": {
-            action.name: list(delta)
-            for action, delta
-            in action_vectors.items()
-        },
-        "traversable_colors": dict(
-            traversable_color_evidence
-        ),
-    }
-
-    initial_prompt = f"""
-You are analyzing an unknown ARC-style interactive puzzle.
-
-Verified experimental facts:
-
-{json.dumps(
-    verified_facts,
-    indent=2,
-)}
-
-Connected components are low-level visual
-components, not necessarily semantic objects.
-
-Use inspect_scene selectively to answer
-specific remaining questions.
-
-Prefer comparing several relevant components
-in one inspection rather than inspecting every
-component individually.
-
-When you have a plausible world/goal model,
-stop inspecting and call
-submit_scene_analysis.
-
-You have a limited inspection budget.
-"""
-
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {
-                    "type": "text",
-                    "text": initial_prompt,
-                },
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": image_url,
-                    },
-                },
-            ],
-        }
-    ]
-
-    MAX_TOOL_STEPS = 12
-
-    for step in range(MAX_TOOL_STEPS):
-        print(
-            f"[VLM TOOL STEP {step + 1}]",
-            flush=True,
+    object_description = "\n".join(
+        (
+            f"Object {obj.id}: "
+            f"color={obj.color}, "
+            f"bbox={obj.bbox}, "
+            f"center={obj.center}, "
+            f"size={len(obj.pixels)}"
         )
-        if step < MAX_TOOL_STEPS - 1:
-            tools = SCENE_TOOLS
-            tool_choice = "auto"
-        else:
-            tools = [SCENE_TOOLS[1]]
-            tool_choice = {"type": "function",
-                           "function": {"name": ("submit_scene_analysis")},}
-       
-        response = (
-            client.chat.completions.create(
-                model=LOCAL_MODEL,
-                messages=messages,
-                tools=tools,
-                tool_choice=tool_choice,
-                temperature=0,
-                max_tokens=2048,
-                extra_body={
-                    "chat_template_kwargs": {
-                        "enable_thinking": True,
-                    },
-                },
-            )
-        )
-
-        message = (
-            response
-            .choices[0]
-            .message
-        )
-
-        reasoning = (
-            getattr(message,"reasoning",None,)
-            or getattr(message,"reasoning_content",None,)
-            or ""
-        )
-
-        print(
-            "reasoning:",
-            reasoning[:2000],
-            flush=True,
-        )
-
-        tool_calls = (
-            message.tool_calls
-            or []
-        )
-
-        print(
-            "tool call count:",
-            len(tool_calls),
-            flush=True,
-        )
-
-        assistant_message = {"role": "assistant",}
-
-        if message.content:
-            assistant_message["content"] = (message.content)
-        if reasoning:
-            assistant_message["reasoning"] = (reasoning)
-        if tool_calls:
-            assistant_message["tool_calls"] = [
-                call.model_dump()
-                for call in tool_calls
-            ]
-
-        messages.append(assistant_message)
-
-        remaining = (MAX_TOOL_STEPS - step)
-        if remaining == 2:
-            messages.append(
-                {
-                    "role": "user",
-                    "content": (
-                        "Only two tool steps remain. "
-                        "If the available evidence is "
-                        "sufficient, submit now. "
-                        "Otherwise perform at most one "
-                        "final discriminating inspection."
-                    ),
-                }
-            )
-
-        for call in tool_calls:
-            name = (
-                call.function.name
-            )
-
-            args = json.loads(
-                call.function.arguments
-            )
-
-            print(
-                f"[TOOL] {name}: {args}",
-                flush=True,
-            )
-
-            if (name == "submit_scene_analysis"):
-                return (
-                    validate_scene_analysis(
-                        args,
-                        controlled_components,
-                        objects,
-                        traversable_color_evidence,
-                    )
-                )
-
-            if name == "inspect_scene":
-                result = inspect_scene(
-                    args=args,
-                    frame=frame,
-                    objects=objects,
-                    controlled_components=(controlled_components),
-                    action_vectors=(action_vectors),
-                    traversable_color_evidence=(traversable_color_evidence),
-                )
-
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": (
-                            call.id
-                        ),
-                        "content": json.dumps(
-                            result
-                        ),
-                    }
-                )
-
-        if not tool_calls:
-            print(
-                "[VLM] no tool call; "
-                "asking model to continue",
-                flush=True,
-            )
-
-    raise RuntimeError(
-        "Qwen did not submit scene analysis "
-        "within tool-step budget."
+        for obj in objects
     )
 
-class MyAgentCore:
+    # check if objects are contained in other objects
+    relationships = generate_containment_relationships(objects)
+    relationship_description = "\n".join(
+        f"Object {r.a} {r.relation} Object {r.b}"
+        for r in relationships
+    )
+    regions = build_composite_regions(
+        relationships
+    )
+
+    region_description = "\n".join(
+        (
+            f"Region: container Object {r.container_id}, "
+            f"contents={r.content_ids}"
+        )
+        for r in regions
+    )
+    action_description = "\n".join(
+        (
+            f"{action.name}: {delta}"
+        )
+        for action, delta
+        in action_vectors.items()
+    )
+
+    # traversable color
+    if traversable_color_evidence:
+        traversability_description = "\n".join(
+            (
+                f"Color {color}: "
+                f"{count} successful traversal observations"
+            )
+            for color, count
+            in sorted(
+                traversable_color_evidence.items()
+            )
+        )
+    else:
+        traversability_description = (
+            "No experimentally verified "
+            "traversable colors yet."
+        )
+    prompt = f"""
+You are analyzing an unknown interactive visual puzzle.
+
+The game mechanics and objective are unknown.
+Do not assume this is a navigation game, collection game,
+pattern-matching game, or any other specific type of game.
+
+========================
+VERIFIED EXPERIMENTAL FACTS
+========================
+
+The agent experimentally observed these action effects:
+
+{action_description}
+
+Experimentally identified controllable components:
+
+{sorted(controlled_components)}
+
+These components moved consistently in direct response to the
+agent's actions. Treat them as parts of the controllable entity.
+
+Do not assume the controllable entity is necessarily a traditional
+player/avatar.
+
+========================
+DETECTED COMPONENTS
+========================
+
+{object_description}
+
+These components were deterministically extracted from the frame.
+
+========================
+SPATIAL RELATIONSHIPS
+========================
+
+{relationship_description}
+
+IMPORTANT:
+BBOX_INSIDE means only that one object's bounding box lies inside
+another object's bounding box.
+
+It does NOT prove that the outer object is a semantic container
+or that the inner object is truly enclosed by it.
+
+========================
+COMPOSITE REGION CANDIDATES
+========================
+
+{region_description}
+
+These regions are heuristic groupings derived from bounding-box
+relationships. Treat them as structural clues, not verified objects.
+
+========================
+EXPERIMENTAL TERRAIN EVIDENCE
+========================
+
+{traversability_description}
+
+A successful traversal observation means that the controllable
+entity moved into cells of that color during an experimentally
+observed action.
+
+This is evidence that the color may represent traversable terrain
+in the current game.
+
+Do not treat a color with successful traversal evidence as
+non-traversable solely because of its visual appearance.
+
+This does not prove that every cell of that color is always
+traversable; game mechanics may be context-dependent.
+
+========================
+COORDINATE CONVENTION
+========================
+
+Movement vectors use (dx, dy).
+
+dx > 0 = RIGHT
+dx < 0 = LEFT
+dy > 0 = DOWN
+dy < 0 = UP
+
+Therefore:
+
+(0, -5) = UP
+(0, 5)  = DOWN
+(-5, 0) = LEFT
+(5, 0)  = RIGHT
+
+========================
+EVIDENCE PRIORITY
+========================
+
+When evidence conflicts, use this priority:
+
+1. Experimentally verified action effects and controllable components
+2. Deterministically detected component geometry
+3. Computed spatial relationships and composite-region candidates
+4. Visual interpretation of the image
+5. General assumptions about how games usually work
+
+Never override higher-priority evidence with a lower-priority guess.
+
+========================
+ANALYSIS TASK
+========================
+
+First identify:
+
+1. wall_candidates
+   - Objects that may behave as obstacles, barriers, boundaries,
+     or non-traversable structures.
+
+2. important_objects
+   - Non-controlled objects that appear structurally unusual,
+     interactive, target-like, reference-like, or otherwise relevant.
+
+Then evaluate EVERY goal category below:
+
+- reach_object
+- match_pattern
+- collect_objects
+- activate_object
+- move_into_region
+- transform_shape
+- unknown
+
+For every category provide:
+
+- confidence from 0.0 to 1.0
+- relevant target object IDs
+- concise evidence based on the current scene
+
+Confidence measures strength of evidence, not certainty.
+The values do not need to sum to 1.
+
+Use confidence 0.0 when there is no meaningful evidence.
+
+For unknown:
+- use higher confidence when the current evidence does not strongly
+  distinguish among the other goal categories.
+- target_ids should normally be empty.
+
+If a goal has no plausible target object, return an empty target_ids list.
+
+========================
+COLOR REASONING
+========================
+
+Color values are symbolic visual categories.
+
+Do NOT assume a universal semantic meaning for a color
+(for example, do not assume blue is water or black is a wall).
+
+However, color is important evidence.
+
+When inferring object roles, consider:
+
+- Objects with the same color may share a material or semantic role.
+- Large connected regions of one color may represent floor,
+  terrain, background, walls, or boundaries.
+- A color occupied by or successfully entered by the controllable
+  entity is evidence that this color may be traversable.
+- A color repeatedly bordering or blocking the controllable entity
+  may be evidence that it is non-traversable.
+- Small regions whose colors differ sharply from surrounding terrain
+  may be interactive objects, markers, targets, or indicators.
+- Repeated color patterns across structurally similar regions may be
+  evidence for a pattern-matching or transformation objective.
+
+Never infer a role from color alone.
+Combine color with geometry, movement evidence, connectivity,
+location, containment, and repeated structure.
+
+========================
+RULES
+========================
+
+- Never classify controlled components as walls, obstacles,
+  collectibles, targets, or goal objects.
+
+- Never include controlled component IDs in target_ids.
+
+- Do not reinterpret experimentally verified action vectors.
+
+- Do not infer a goal merely because an object is large,
+  centrally located, brightly colored, or visually prominent.
+
+- Prefer relational evidence such as:
+  similar shapes,
+  matching colors,
+  repeated structures,
+  containment,
+  alignment,
+  relative placement,
+  symmetry,
+  or differences between structurally similar regions.
+
+- Distinguish observation from hypothesis.
+
+- Reference object IDs explicitly in the evidence.
+
+- Do not invent game mechanics that are unsupported by the image
+  or structured observations.
+
+- Return only the structure required by the supplied JSON schema.
+"""
+
+    response = client.chat.completions.create(
+        model=LOCAL_MODEL,
+
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": prompt,
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": image_url,
+                        },
+                    },
+                ],
+            }
+        ],
+
+        temperature=0,
+
+        max_tokens=2048,
+
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "scene_analysis",
+                "schema": SCENE_SCHEMA,
+            },
+        },
+    )
+
+    raw = response.choices[0].message.content
+
+    if not raw:
+        raise RuntimeError(
+            "Local VLM returned no content."
+        )
+
+    analysis = json.loads(raw)
+
+    analysis = validate_scene_analysis(
+        analysis,
+        controlled_components,
+        objects,
+        traversable_color_evidence,
+    )
+
+    return analysis
+
+class MyAgent2(Agent):
     MAX_ACTIONS = 20
 
-    def __init__(self):
+    def __init__(self, *args: Any, **kwargs: Any):
+        super().__init__(*args, **kwargs)
         self.previous_state = None
         self.previous_action = None
         self.action_effects = {}
@@ -1478,7 +1326,13 @@ class MyAgentCore:
         self.mode = "DISCOVER"
         self.previous_frame = None
         self.traversable_color_evidence = defaultdict(int)
-        self.act_steps = 0
+
+    def is_done(
+        self,
+        frames: list[FrameData],
+        latest_frame: FrameData,
+    ) -> bool:
+        return latest_frame.state is GameState.WIN
 
     def infer_controlled_entity(self):
         if len(self.action_components) < 4:
@@ -1549,37 +1403,7 @@ class MyAgentCore:
             "TRAVERSABLE COLOR COUNTS:",
             dict(self.traversable_color_evidence),
         )
-
-    def track_controlled_entity(
-        self,
-        transition,
-    ):
-        if not self.controlled_component_ids:
-            return
-
-        expected_delta = self.action_vectors.get(
-            self.previous_action
-        )
-
-        if expected_delta is None:
-            return
-
-        current_ids = set()
-
-        for movement in transition.moved_objects:
-
-            if (
-                movement.before.id
-                in self.controlled_component_ids
-                and movement.delta == expected_delta
-            ):
-                current_ids.add(
-                    movement.after.id
-                )
-
-        if current_ids:
-            self.controlled_component_ids = current_ids
-
+    
     def learn(self, action, transition):
         if action is None:
             return
@@ -1627,28 +1451,6 @@ class MyAgentCore:
                     self.previous_action,
                     transition,
                 )
-            if (self.mode == "ACT" and self.act_steps >= 1):
-                print(
-                    "\n=== POST-ACT TRANSITION ===",
-                    flush=True,
-                )
-                print(
-                    "action:",
-                    self.previous_action.name,
-                    flush=True,
-                )
-                print(
-                    "movements:",
-                    [
-                        {
-                            "before": m.before.id,
-                            "after": m.after.id,
-                            "delta": m.delta,
-                        }
-                        for m in transition.moved_objects
-                    ],
-                    flush=True,
-                )
             else:
                 self.track_controlled_entity(
                     transition,
@@ -1669,50 +1471,49 @@ class MyAgentCore:
     
     def choose_action(
         self,
-        frame: np.ndarray,
-        available_actions: list[int],
-    ) -> arcengine.GameAction:
+        frames: list[FrameData],
+        latest_frame: FrameData,
+    ) -> GameAction:
 
-        objects = self.observe(frame)
+        # Reset if needed
+        if latest_frame.state in [
+            GameState.NOT_PLAYED,
+            GameState.GAME_OVER,
+        ]:
+            self.previous_state = None
+            self.previous_action = None
+            return GameAction.RESET
 
-        # DISCOVER → ANALYZE
+        # latest_frame.frame is a list of grids.
+        # For now, examine the most recent one.
+        if latest_frame.frame:
+            frame = latest_frame.frame[-1]
+            self.observe(frame)
+
+        # once actions are exhausted, move on to analyze the scene
         if (
             self.mode == "DISCOVER"
             and len(self.action_vectors) >= 4
             and self.scene_analysis is None
         ):
-            print(
-                "[MODE] DISCOVER -> ANALYZE",
-                flush=True,
-            )
-
-            print(
-                "[MODE] action vectors:",
-                {
-                    a.name: v
-                    for a, v
-                    in self.action_vectors.items()
-                },
-                flush=True,
-            )
             self.mode = "ANALYZE"
 
             self.scene_analysis = analyze_scene_vlm(
                 frame=frame,
-                objects=objects,
+                objects=self.previous_state,
                 action_vectors=self.action_vectors,
-                controlled_components=self.controlled_component_ids,
-                traversable_color_evidence=self.traversable_color_evidence,
+                controlled_components=(self.controlled_component_ids),
+                traversable_color_evidence=(self.traversable_color_evidence),
             )
 
             print("\n=== VLM SCENE ANALYSIS ===")
+
             print(
                 json.dumps(
                     self.scene_analysis,
                     indent=2,
                 )
             )
-
             self.mode = "ACT"
             
         if self.mode == "ACT":
@@ -1720,15 +1521,7 @@ class MyAgentCore:
             goal = select_primary_goal(
                 self.scene_analysis
             )
-            
-            print(
-                "[ACT] selected goal:",
-                goal,
-                flush=True,
-            )
 
-            action = None
-            
             if goal is not None:
                 if goal["type"] in {
                     "reach_object",
@@ -1738,34 +1531,20 @@ class MyAgentCore:
                     action = choose_goal_action(
                         frame=np.asarray(frame),
                         objects=self.previous_state,
-                        controlled_ids=(self.controlled_component_ids),
+                        controlled_ids=(
+                            self.controlled_component_ids
+                        ),
                         target_ids=goal["target_ids"],
                         action_vectors=self.action_vectors,
                         scene_analysis=self.scene_analysis,
-                        traversable_color_evidence=(self.traversable_color_evidence),
+                        traversable_color_evidence=(
+                            self.traversable_color_evidence
+                        ),
                     )
-                    
-                    if action is None:
-                        action = choose_exploration_action(
-                            frame=np.asarray(frame),
-                            objects=self.previous_state,
-                            controlled_ids=(self.controlled_component_ids),
-                            action_vectors=self.action_vectors,
-                            scene_analysis=(self.scene_analysis),
-                            traversable_color_evidence=(self.traversable_color_evidence),
-                        )
 
-                    if action is None:
-                        action = (arcengine.GameAction.ACTION1)
-                    
-                    print(
-                        "[ACT] executing:",
-                        action.name,
-                        flush=True,
-                    )
-                    self.previous_action = action
-                    self.act_steps += 1
-                    return action
+                    if action is not None:
+                        self.previous_action = action
+                        return action
 
             # No sufficiently confident goal.
             # Fall back to local exploration instead of returning None.
@@ -1787,171 +1566,24 @@ class MyAgentCore:
                 return action
 
             # Absolute safety fallback:
-            self.previous_action = arcengine.GameAction.ACTION1
-            return arcengine.GameAction.ACTION1
+            self.previous_action = GameAction.ACTION1
+            return GameAction.ACTION1
         
         if self.mode == "DISCOVER":
-
             actions = [
-                arcengine.GameAction.ACTION1,
-                arcengine.GameAction.ACTION2,
-                arcengine.GameAction.ACTION3,
-                arcengine.GameAction.ACTION4,
+                GameAction.ACTION1,
+                GameAction.ACTION2,
+                GameAction.ACTION3,
+                GameAction.ACTION4,
             ]
-
-            # Only use currently legal actions.
-            actions = [
-                action
-                for action in actions
-                if action.value in available_actions
-            ]
-
-            if not actions:
-                return arcengine.GameAction.RESET
 
             action = actions[
                 self.action_index % len(actions)
             ]
 
             self.action_index += 1
+
             self.previous_action = action
 
             return action
-        
-@dataclass
-class MyAgentSolver(Solver):
-    label: str = "MyAgent2"
-
-    max_actions_per_game: int = 100
-
-    async def _run_games(
-        self,
-        games: list[taaf.game.Game],
-    ) -> None:
-
-        try:
-            await asyncio.gather(
-                *(
-                    self._play_one(game)
-                    for game in games
-                )
-            )
-
-        except asyncio.CancelledError:
-
-            for game in games:
-                run = game.game_run
-
-                if (
-                    run is not None
-                    and run.final_score is None
-                ):
-                    game.finish_game()
-
-            raise
-
-    async def _play_one(
-        self,
-        game: taaf.game.Game,
-    ) -> None:
-
-        agent = MyAgentCore()
-        actions_taken = 0
-
-        try:
-            while True:
-
-                # Required so benchmark cancellation can run.
-                await asyncio.sleep(0)
-
-                run = game.game_run
-
-                if (
-                    run is None
-                    or run.state != "playing"
-                ):
-                    break
-
-                if (
-                    actions_taken
-                    >= self.max_actions_per_game
-                ):
-                    break
-
-                state = game.current_state
-
-                # Handle engine GAME_OVER.
-                if (
-                    state.raw.state
-                    == arcengine.GameState.GAME_OVER
-                ):
-                    action = (
-                        arcengine.GameAction.RESET
-                    )
-
-                else:
-
-                    frame = np.asarray(
-                        state.frame.data
-                    )
-
-                    action = agent.choose_action(
-                        frame=frame,
-                        available_actions=list(
-                            state.available_actions
-                        ),
-                    )
-
-                action_input = (
-                    arcengine.ActionInput(
-                        id=action,
-                        data={},
-                    )
-                )
-
-                game.execute_action(
-                    action_input,
-                )
-
-                actions_taken += 1
-
-            if (
-                game.game_run is not None
-                and game.game_run.final_score is None
-            ):
-                game.finish_game()
-
-        except asyncio.CancelledError:
-
-            if (
-                game.game_run is not None
-                and game.game_run.final_score is None
-            ):
-                game.finish_game()
-
-            raise
-        except Exception as exc:
-            game_name = (
-                getattr(game, "game_id", None)
-                or getattr(game, "env_name", None)
-                or "unknown"
-            )
-
-            print(
-                f"\n[MYAGENT ERROR] {game_name}: "
-                f"{type(exc).__name__}: {exc}",
-                flush=True,
-            )
-
-            traceback.print_exc()
-
-            run = game.game_run
-
-            if run is not None:
-                run.solver_note = (
-                    f"{type(exc).__name__}: {exc}"
-                )
-
-                if run.final_score is None:
-                    with contextlib.suppress(Exception):
-                        game.finish_game()
+    
