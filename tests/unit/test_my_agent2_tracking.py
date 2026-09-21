@@ -54,13 +54,14 @@ def load_solver():
         'get_controlled_pixels', 'pixel_distance', 'destination_colors',
         'bbox_gap', 'expand_goal_target_region',
         'select_primary_goal', 'MyAgentSolver',
-        'validate_scene_analysis',
+        'validate_scene_analysis', 'SceneAnalysisValidationError',
+        'detect_ui_candidates',
         'choose_goal_action_bfs', 'choose_frontier_action', 'choose_exploration_action',
         'plan_to_nearest_frontier', 'get_frontier_actions', 'inverse_action',
     }
     namespace = dict(dataclass=dataclass, np=np, hashlib=hashlib,
                      deque=deque, defaultdict=defaultdict,
-                     arcengine=SimpleNamespace(GameAction=Action, GameState=SimpleNamespace(GAME_OVER='over'),
+                     arcengine=SimpleNamespace(GameAction=Action, GameState=SimpleNamespace(GAME_OVER='over', WIN='win'),
                                                ActionInput=lambda **kw: SimpleNamespace(**kw)),
                      taaf=SimpleNamespace(game=SimpleNamespace(Game=object)), Solver=object,
                      asyncio=asyncio, json=json, contextlib=contextlib, traceback=traceback)
@@ -423,6 +424,58 @@ class TestPersistentTracking(unittest.TestCase):
         self.assertEqual(result['goal_scores']['reach_object']['target_ids'], [])
         self.assertEqual(result['goal_scores']['reach_object']['confidence'], 0)
 
+    def test_validation_retries_when_goal_targets_controlled_or_ui_components(self):
+        frame = np.zeros((12, 12), dtype=int)
+        player = obj({(5, 5)}, frame_id=1)
+        declared_ui = obj({(6, 6)}, frame_id=2)
+        edge_ui = obj({(10, 4)}, frame_id=3)
+        target = obj({(4, 4)}, frame_id=4)
+        for item, track in zip(
+            (player, declared_ui, edge_ui, target),
+            ('player', 'declared-ui', 'edge-ui', 'target'),
+        ):
+            item.track_id = track
+        analysis = {
+            'wall_candidates': [], 'ui_candidates': [declared_ui.id],
+            'important_objects': [declared_ui.id, edge_ui.id, target.id],
+            'goal_scores': {
+                'reach_object': {
+                    'target_ids': [player.id, declared_ui.id, edge_ui.id, target.id],
+                    'confidence': .9, 'evidence': '',
+                },
+            },
+        }
+
+        with self.assertRaises(M['SceneAnalysisValidationError']) as raised:
+            M['validate_scene_analysis'](
+                analysis, {player.id}, [player, declared_ui, edge_ui, target], {}, frame,
+            )
+
+        feedback = raised.exception.feedback
+        rejected = feedback['rejected_target_ids']['reach_object']
+        self.assertIn('controlled_component', rejected[player.id])
+        self.assertIn('declared_ui_candidate', rejected[declared_ui.id])
+        self.assertIn('edge_ui_candidate', rejected[edge_ui.id])
+        self.assertEqual(feedback['deterministic_edge_ui_ids'], [edge_ui.id])
+
+    def test_validation_preserves_valid_goal_and_promotes_edge_components_to_ui(self):
+        frame = np.zeros((12, 12), dtype=int)
+        edge_ui = obj({(0, 3)}, frame_id=1)
+        target = obj({(5, 5)}, frame_id=2)
+        edge_ui.track_id, target.track_id = 'edge-ui', 'target'
+        analysis = {
+            'wall_candidates': [], 'ui_candidates': [], 'important_objects': [edge_ui.id, target.id],
+            'goal_scores': {
+                'reach_object': {'target_ids': [target.id], 'confidence': .9, 'evidence': ''},
+            },
+        }
+        result = M['validate_scene_analysis'](
+            analysis, set(), [edge_ui, target], {}, frame,
+        )
+        self.assertEqual(result['ui_candidates'], [edge_ui.id])
+        self.assertEqual(result['important_objects'], [target.id])
+        self.assertEqual(result['goal_scores']['reach_object']['target_ids'], [target.id])
+
     def test_failure_memory_does_not_penalize_identical_other_target(self):
         core = M['MyAgentCore']()
         objects = core.tracker.update([obj({(0, 0)}), obj({(0, 10)}, frame_id=1)])
@@ -507,8 +560,11 @@ class TestPersistentTracking(unittest.TestCase):
         frame[10, 10] = 2
         objects = core.observe(frame)
         player = next(o for o in objects if o.color == 1)
+        ui = next(o for o in objects if o.color == 2)
         core.controlled_track_ids = {player.track_id}
         core.resolve_controlled_ids(objects)
+        core.scene_analysis = {'wall_candidates': [], 'ui_candidates': [ui.id]}
+        core.capture_scene_role_tracks(objects)
         core.mode = 'ACT'
         core.previous_action = Action.ACTION1
         core.action_vectors = {Action.ACTION1: (0, -2)}
@@ -517,6 +573,91 @@ class TestPersistentTracking(unittest.TestCase):
         frame[10, 10] = 3
         core.observe(frame)
         self.assertIn((source, Action.ACTION1), core.blocked_actions)
+
+    def test_door_change_clears_stale_navigation_memory(self):
+        core = M['MyAgentCore']()
+        frame = np.zeros((12, 12), dtype=int)
+        frame[3:5, 3:5] = 1
+        frame[8, 8] = 2
+        objects = core.observe(frame)
+        player = next(o for o in objects if o.color == 1)
+        core.controlled_track_ids = {player.track_id}
+        core.resolve_controlled_ids(objects)
+        core.mode = 'ACT'
+        core.previous_action = Action.ACTION1
+        core.action_vectors = {Action.ACTION1: (0, -2)}
+        core.last_action_state = frozenset(player.pixels)
+        source = core.last_action_state
+        core.failed_moves.add((source, Action.ACTION1))
+        core.blocked_actions.add((source, Action.ACTION1))
+        core.transition_graph[source][Action.ACTION1] = frozenset({(1, 1)})
+        core.tested_actions[source].add(Action.ACTION1)
+        core.state_visit_counts[source] = 2
+
+        # A door opening changes a non-traversable gameplay component while
+        # the player remains in place. The previous blocked result is stale.
+        core.traversable_color_evidence[0] = 2
+        frame[8, 8] = 0
+        core.observe(frame)
+
+        self.assertFalse(core.failed_moves)
+        self.assertFalse(core.blocked_actions)
+        self.assertFalse(core.transition_graph)
+        self.assertFalse(core.tested_actions)
+        # The reset occurs before the current position is recorded again.
+        self.assertEqual(core.state_visit_counts, {source: 1})
+
+    def test_floor_and_ui_changes_do_not_clear_navigation_memory(self):
+        core = M['MyAgentCore']()
+        frame = np.zeros((12, 12), dtype=int)
+        frame[3:5, 3:5] = 1
+        frame[8, 8] = 2
+        objects = core.observe(frame)
+        player = next(o for o in objects if o.color == 1)
+        ui = next(o for o in objects if o.color == 2)
+        core.controlled_track_ids = {player.track_id}
+        core.resolve_controlled_ids(objects)
+        core.mode = 'ACT'
+        core.previous_action = Action.ACTION1
+        core.action_vectors = {Action.ACTION1: (0, -2)}
+        core.last_action_state = frozenset(player.pixels)
+        source = core.last_action_state
+        core.failed_moves.add((source, Action.ACTION1))
+        core.blocked_actions.add((source, Action.ACTION1))
+        core.traversable_color_evidence[0] = 2
+        core.scene_analysis = {'wall_candidates': [], 'ui_candidates': [ui.id]}
+        core.capture_scene_role_tracks(objects)
+
+        # A UI animation and the background reshaping around a stationary
+        # player do not alter collision topology.
+        frame[8, 8] = 3
+        core.observe(frame)
+
+        self.assertIn((source, Action.ACTION1), core.failed_moves)
+        self.assertIn((source, Action.ACTION1), core.blocked_actions)
+
+    def test_player_motion_does_not_treat_background_reshaping_as_a_door_change(self):
+        core = M['MyAgentCore']()
+        frame = np.zeros((12, 12), dtype=int)
+        frame[3:5, 3:5] = 1
+        objects = core.observe(frame)
+        player = next(o for o in objects if o.color == 1)
+        core.controlled_track_ids = {player.track_id}
+        core.resolve_controlled_ids(objects)
+        core.mode = 'ACT'
+        core.previous_action = Action.ACTION4
+        core.action_vectors = {Action.ACTION1: (0, -2), Action.ACTION4: (2, 0)}
+        core.last_action_state = frozenset(player.pixels)
+        remembered = (core.last_action_state, Action.ACTION1)
+        core.failed_moves.add(remembered)
+        core.blocked_actions.add(remembered)
+
+        frame[3:5, 3:5] = 0
+        frame[3:5, 5:7] = 1
+        core.observe(frame)
+
+        self.assertIn(remembered, core.failed_moves)
+        self.assertIn(remembered, core.blocked_actions)
 
     def test_target_contact_records_ui_effect_and_requests_reanalysis(self):
         core = M['MyAgentCore']()
@@ -552,6 +693,70 @@ class TestPersistentTracking(unittest.TestCase):
         self.assertIn('target contact produced', core.reanalysis_reason)
         self.assertFalse(core.goal_experiments)
         self.assertIsNone(core.pending_interaction)
+
+    def test_contact_provides_only_changed_or_new_gameplay_candidates(self):
+        core = M['MyAgentCore']()
+        before_frame = np.full((20, 20), 3, dtype=int)
+        player = obj({(7, 1), (7, 2)}, color=1, frame_id=1)
+        target = obj({(6, 1)}, color=0, frame_id=2)
+        changed = obj({(5, 5)}, color=2, frame_id=3)
+        stable = obj({(8, 2)}, color=2, frame_id=4)
+        ui = obj({(0, 8)}, color=11, frame_id=5)
+        unlocked = obj({(6, 8)}, color=7, frame_id=6)
+        barrier = obj({(row, 4) for row in range(20)}, color=5, frame_id=7)
+        for item in (player, target, changed, stable, ui, unlocked, barrier):
+            for y, x in item.pixels:
+                before_frame[y, x] = item.color
+        before = core.tracker.update([player, target, changed, stable, ui, unlocked, barrier])
+        player, target, changed, stable, ui, unlocked, barrier = before
+        core.previous_state = before
+        core.controlled_track_ids = {player.track_id}
+        core.resolve_controlled_ids(before)
+        core.current_goal = {'type': 'reach_object', 'target_tracks': [target.track_id]}
+        core.scene_analysis = {'wall_candidates': [], 'ui_candidates': [ui.id]}
+        core.capture_scene_role_tracks(before)
+        core.traversable_color_evidence[3] = 2
+        core.action_vectors = {
+            Action.ACTION1: (0, -1), Action.ACTION2: (0, 1),
+            Action.ACTION3: (-1, 0), Action.ACTION4: (1, 0),
+        }
+        core.previous_action = Action.ACTION1
+        core.pending_interaction = core.begin_interaction_observation(
+            [target.id], Action.ACTION1, frame=before_frame,
+        )
+
+        after_frame = np.full((20, 20), 3, dtype=int)
+        after_objects = [
+            obj({(6, 1), (6, 2)}, color=1, frame_id=10),
+            obj({(5, 5)}, color=4, frame_id=11),
+            obj({(8, 2)}, color=2, frame_id=12),
+            obj({(0, 8)}, color=12, frame_id=13),
+            obj({(10, 12)}, color=6, frame_id=14),
+            obj({(6, 8)}, color=7, frame_id=15),
+        ]
+        for item in after_objects:
+            for y, x in item.pixels:
+                after_frame[y, x] = item.color
+        after = core.tracker.update(
+            after_objects, core.controlled_track_ids, (0, -1),
+        )
+        core.resolve_controlled_ids(after)
+        observation = core.observe_pending_interaction(after, frame=after_frame)
+
+        by_track = {item['track_id']: item for item in observation['next_goal_candidates']}
+        changed_after = next(o for o in after if o.track_id == changed.track_id)
+        new_after = next(o for o in after if o.color == 6)
+        unlocked_after = next(o for o in after if o.track_id == unlocked.track_id)
+        self.assertIn(changed_after.track_id, by_track)
+        self.assertIn('changed', by_track[changed_after.track_id]['reasons'])
+        self.assertIn(new_after.track_id, by_track)
+        self.assertIn('appeared', by_track[new_after.track_id]['reasons'])
+        self.assertIn(unlocked_after.track_id, by_track)
+        self.assertIn('became_reachable', by_track[unlocked_after.track_id]['reasons'])
+        self.assertNotIn(target.track_id, by_track)
+        self.assertNotIn(stable.track_id, by_track)
+        self.assertNotIn(ui.track_id, by_track)
+        self.assertEqual(core.post_interaction_candidates, observation['next_goal_candidates'])
 
     def test_predicted_contact_survives_target_and_player_resegmentation(self):
         core = M['MyAgentCore']()
@@ -693,6 +898,72 @@ class TestPersistentTracking(unittest.TestCase):
         self.assertEqual(constructed, [0, 1, 2])
         self.assertEqual(used, [0, 1, 2])
         self.assertEqual(actions, [Action.ACTION1, Action.ACTION1, Action.RESET, Action.ACTION1])
+
+    def test_runner_finishes_on_engine_win_without_another_action(self):
+        states = [
+            SimpleNamespace(raw=SimpleNamespace(state=state, levels_completed=0),
+                            frame=SimpleNamespace(data=np.zeros((2, 2))), available_actions=[1])
+            for state in ('playing', 'win')
+        ]
+        actions, contexts, finish_calls = [], [], []
+
+        def core_factory(episode_id=0):
+            def choose_action(**kwargs):
+                return Action.ACTION1
+            def set_runtime_context(raw_state, game_run):
+                contexts.append((raw_state.state, raw_state.levels_completed, game_run.state))
+            return SimpleNamespace(
+                choose_action=choose_action,
+                set_runtime_context=set_runtime_context,
+            )
+
+        class Game:
+            game_run = SimpleNamespace(state='playing', final_score=None)
+            current_state = states[0]
+
+            def execute_action(self, action):
+                actions.append(action.id)
+                self.current_state = states[1]
+
+            def finish_game(self):
+                finish_calls.append(True)
+                self.game_run.final_score = 1
+
+        with patch.dict(M, MyAgentCore=core_factory):
+            asyncio.run(M['MyAgentSolver']()._play_one(Game()))
+        self.assertEqual(actions, [Action.ACTION1])
+        self.assertEqual(contexts, [('playing', 0, 'playing')])
+        self.assertEqual(finish_calls, [True])
+
+    def test_runtime_context_is_passed_to_scene_analysis(self):
+        core = M['MyAgentCore']()
+        frame = np.zeros((8, 8), dtype=int)
+        frame[3:5, 3:5] = 1
+        objects = core.observe(frame)
+        player = next(o for o in objects if o.color == 1)
+        core.controlled_track_ids = {player.track_id}
+        core.resolve_controlled_ids(objects)
+        core.mode = 'ANALYZE'
+        core.set_runtime_context(
+            SimpleNamespace(state='playing', levels_completed=2),
+            SimpleNamespace(state='playing'),
+        )
+        core.post_interaction_candidates = [
+            {'frame_id': 4, 'track_id': 'new-door', 'reasons': ['appeared']},
+        ]
+        analysis = {
+            'wall_candidates': [], 'ui_candidates': [], 'important_objects': [],
+            'goal_scores': {'unknown': {'confidence': 1, 'target_ids': []}},
+        }
+        captured = {}
+        with contextlib.redirect_stdout(io.StringIO()), patch.dict(
+            M, analyze_scene_vlm=lambda **kwargs: captured.update(kwargs) or analysis,
+        ):
+            core.choose_action(frame, [1])
+        self.assertEqual(captured['runtime_context'], {
+            'engine_state': 'playing', 'levels_completed': 2, 'run_state': 'playing',
+        })
+        self.assertEqual(captured['post_interaction_candidates'], core.post_interaction_candidates)
 
     def test_analysis_to_action_uses_track_targets(self):
         core = M['MyAgentCore']()

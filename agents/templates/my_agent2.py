@@ -961,11 +961,20 @@ def normalize_scene_analysis(analysis):
 
     return analysis
 
+class SceneAnalysisValidationError(ValueError):
+    """A retryable scene submission with unsafe target selections."""
+
+    def __init__(self, feedback):
+        self.feedback = feedback
+        super().__init__(feedback["error"])
+
+
 def validate_scene_analysis(
     analysis,
     controlled_ids,
     objects,
-    traversable_color_evidence,):
+    traversable_color_evidence,
+    frame=None,):
 
     analysis = normalize_scene_analysis(analysis)
 
@@ -989,6 +998,14 @@ def validate_scene_analysis(
             [],
         )
     )
+    edge_ui_ids = (
+        set(detect_ui_candidates(frame, objects, controlled_ids))
+        if frame is not None else set()
+    )
+    protected_ui_ids = ui_ids | edge_ui_ids
+    # Keep deterministic UI evidence in the accepted analysis, so planners
+    # and subsequent frames preserve the same exclusion.
+    analysis["ui_candidates"] = sorted(protected_ui_ids)
 
     # Controlled entity cannot be a wall.
     analysis["wall_candidates"] = [
@@ -1015,11 +1032,14 @@ def validate_scene_analysis(
         obj_id
         for obj_id in analysis["important_objects"]
         if obj_id not in controlled_ids
-           and obj_id not in ui_ids
+           and obj_id not in protected_ui_ids
     ]
 
-    # Remove controlled components from
-    # every goal's target list.
+    rejected_targets = {}
+    # A model can be uncertain about semantics, but cannot route to a
+    # controlled component or an edge/UI widget with the movement planner.
+    # Reject the submission rather than silently accepting an empty or
+    # partially corrupted goal list.
     for goal_type, result in (
         analysis["goal_scores"].items()
     ):
@@ -1028,11 +1048,21 @@ def validate_scene_analysis(
             result["target_ids"]
         )
 
-        cleaned_targets = (
-            original_targets
-            - controlled_ids
-            - ui_ids
-        )
+        rejected = {}
+        for obj_id in original_targets:
+            reasons = []
+            if obj_id in controlled_ids:
+                reasons.append("controlled_component")
+            if obj_id in ui_ids:
+                reasons.append("declared_ui_candidate")
+            if obj_id in edge_ui_ids:
+                reasons.append("edge_ui_candidate")
+            if reasons:
+                rejected[obj_id] = reasons
+        if rejected:
+            rejected_targets[goal_type] = rejected
+
+        cleaned_targets = original_targets - controlled_ids - protected_ui_ids
         cleaned_targets = {
             obj_id for obj_id in cleaned_targets
             if obj_id in objects_by_id and objects_by_id[obj_id].track_id is not None
@@ -1052,6 +1082,16 @@ def validate_scene_analysis(
                 " Targets were removed because they were controlled, UI, "
                 "missing, or ambiguously tracked components."
             )
+
+    if rejected_targets:
+        raise SceneAnalysisValidationError({
+            "error": (
+                "Goal targets included components that cannot be navigated to. "
+                "Submit a new analysis with only current gameplay targets."
+            ),
+            "rejected_target_ids": rejected_targets,
+            "deterministic_edge_ui_ids": sorted(edge_ui_ids),
+        })
 
     return analysis
 
@@ -2307,7 +2347,9 @@ def analyze_scene_vlm(
     previous_feedback=None,
     reanalysis_reason=None,
     tracking_events=None,
-    causal_observations=None,):
+    causal_observations=None,
+    runtime_context=None,
+    post_interaction_candidates=None,):
     image_url = frame_to_data_url(frame)
     controlled_description = [
         {
@@ -2327,6 +2369,8 @@ def analyze_scene_vlm(
         in controlled_components
     ]
     verified_facts = {
+        "runtime_context": runtime_context or {},
+        "post_interaction_candidates": post_interaction_candidates or [],
         "tracking_events": tracking_events or [],
         "causal_observations": causal_observations or [],
         "frame_shape": list(np.asarray(frame).shape),
@@ -2416,6 +2460,15 @@ Identify likely UI components in ui_candidates.
 Do not include UI components as goal targets unless there is
 strong evidence that the game explicitly requires interacting
 with the interface itself.
+
+Components listed in edge_ui_candidates are protected from movement-goal
+selection. The validator rejects any submission that targets them, so select
+only current gameplay components away from the screen edge.
+
+post_interaction_candidates contains current non-UI gameplay components found
+from an observed change or a newly reachable route. They are hypotheses, not
+confirmed goals. Prefer them over unrelated components and use their current
+frame_id values exactly when submitting target_ids.
 
 The level may require multiple sequential interactions.
 
@@ -2680,6 +2733,7 @@ small number of actions.
                             controlled_components,
                             objects,
                             traversable_color_evidence,
+                            frame=frame,
                         )
                     )
                 except (KeyError,TypeError,ValueError,) as exc:
@@ -2689,23 +2743,29 @@ small number of actions.
                         flush=True,
                     )
 
+                    feedback = getattr(exc, "feedback", None)
+                    error_content = {
+                        "error": (
+                            "Scene analysis arguments were invalid: "
+                            f"{type(exc).__name__}: {exc}. "
+                            "Retry submit_scene_analysis with "
+                            "goal_scores, important_objects, and "
+                            "wall_candidates as top-level arguments."
+                        )
+                    }
+                    if feedback is not None:
+                        error_content.update(feedback)
+                        error_content["retry_instruction"] = (
+                            "Do not select rejected_target_ids. Choose only "
+                            "current non-UI, non-controlled gameplay components."
+                        )
                     messages.append(
                         {
                             "role": "tool",
                             "tool_call_id": (
                                 call.id
                             ),
-                            "content": json.dumps(
-                                {
-                                    "error": (
-                                        "Scene analysis arguments were invalid: "
-                                        f"{type(exc).__name__}: {exc}. "
-                                        "Retry submit_scene_analysis with "
-                                        "goal_scores, important_objects, and "
-                                        "wall_candidates as top-level arguments."
-                                    )
-                                }
-                            ),
+                            "content": json.dumps(error_content),
                         }
                     )
 
@@ -2835,6 +2895,8 @@ class MyAgentCore:
         self.discovery_state_attempts = defaultdict(int)
         self.action_vectors = {}
         self.scene_analysis = None
+        self.runtime_context = {}
+        self.post_interaction_candidates = []
         self.scene_role_tracks = {}
         self.action_components = {}
         self.controlled_component_ids = set()
@@ -2891,6 +2953,151 @@ class MyAgentCore:
             "CONTROLLED ENTITY:",
             sorted(controlled)
         )
+
+    def set_runtime_context(self, raw_state, game_run=None):
+        """Capture engine facts that explain an interaction's phase change."""
+        engine_state = getattr(raw_state, "state", None)
+        self.runtime_context = {
+            "engine_state": getattr(engine_state, "name", str(engine_state)),
+            "levels_completed": getattr(raw_state, "levels_completed", None),
+            "run_state": getattr(game_run, "state", None),
+        }
+
+    def reachable_gameplay_tracks(self, frame, objects, excluded_tracks=()):
+        """Find non-UI components reachable using only verified movement."""
+        if frame is None or not self.action_vectors:
+            return set()
+        controlled_pixels = get_controlled_pixels(
+            objects, self.controlled_component_ids
+        )
+        if not controlled_pixels:
+            return set()
+        traversable_colors = {
+            color for color, count in self.traversable_color_evidence.items()
+            if count >= 2
+        }
+        if not traversable_colors:
+            return set()
+
+        excluded_tracks = set(excluded_tracks) | self.controlled_track_ids
+        edge_ui_ids = set(detect_ui_candidates(
+            frame, objects, self.controlled_component_ids,
+        ))
+        ui_tracks = set(self.scene_role_tracks.get("ui_candidates", set())) | {
+            obj.track_id for obj in objects
+            if obj.id in edge_ui_ids and obj.track_id is not None
+        }
+        excluded_tracks |= ui_tracks
+        candidates = [
+            obj for obj in objects
+            if (
+                obj.track_id is not None
+                and obj.track_id not in excluded_tracks
+                and obj.color not in traversable_colors
+            )
+        ]
+        height, width = frame.shape
+        start = frozenset(controlled_pixels)
+
+        def can_reach(target_pixels):
+            queue = deque([(start, 0)])
+            visited = {start}
+            while queue:
+                pixels, depth = queue.popleft()
+                if pixels & target_pixels:
+                    return True
+                if depth >= 30:
+                    continue
+                for delta in self.action_vectors.values():
+                    next_pixels = frozenset(translate_pixels(pixels, delta))
+                    if next_pixels in visited:
+                        continue
+                    legal = True
+                    for y, x in next_pixels:
+                        if not (0 <= y < height and 0 <= x < width):
+                            legal = False
+                            break
+                        if (y, x) in target_pixels or (y, x) in controlled_pixels:
+                            continue
+                        if int(frame[y, x]) not in traversable_colors:
+                            legal = False
+                            break
+                    if legal:
+                        visited.add(next_pixels)
+                        queue.append((next_pixels, depth + 1))
+            return False
+
+        return {
+            obj.track_id for obj in candidates
+            if can_reach(obj.pixels)
+        }
+
+    def derive_post_interaction_candidates(self, objects, pending, changes, frame):
+        """Give reanalysis a compact, current list of likely next subgoals."""
+        if frame is None:
+            return []
+        target_tracks = set(pending["target_tracks"])
+        ui_tracks = set(pending["ui_tracks"])
+        before_tracks = set(pending["snapshots"])
+        current_reachable = self.reachable_gameplay_tracks(
+            frame, objects, target_tracks | ui_tracks,
+        )
+        reasons_by_track = defaultdict(set)
+        for change in changes:
+            if change["area"] != "gameplay" or change["kind"] == "not_visible":
+                continue
+            if change["kind"] == "changed":
+                reasons_by_track[change["track_id"]].add(
+                    "moved" if "bbox" in change.get("fields", []) else "changed"
+                )
+            elif change["kind"] == "lineage_changed":
+                reasons_by_track[change["track_id"]].add("resegmented")
+        for obj in objects:
+            if obj.track_id is not None and obj.track_id not in before_tracks:
+                reasons_by_track[obj.track_id].add("appeared")
+        previous_reachable = pending.get("reachable_tracks")
+        if previous_reachable is not None:
+            for track_id in current_reachable - set(previous_reachable):
+                reasons_by_track[track_id].add("became_reachable")
+
+        edge_ui_ids = set(detect_ui_candidates(
+            frame, objects, self.controlled_component_ids,
+        ))
+        current_ui_tracks = set(self.scene_role_tracks.get("ui_candidates", set())) | {
+            obj.track_id for obj in objects
+            if obj.id in edge_ui_ids and obj.track_id is not None
+        }
+        traversable_colors = {
+            color for color, count in self.traversable_color_evidence.items()
+            if count >= 2
+        }
+        candidates = []
+        for obj in objects:
+            reasons = reasons_by_track.get(obj.track_id, set())
+            if (
+                obj.track_id is None
+                or not reasons
+                or obj.track_id in target_tracks | ui_tracks | current_ui_tracks
+                or obj.track_id in self.controlled_track_ids
+                or obj.color in traversable_colors
+            ):
+                continue
+            candidates.append({
+                "frame_id": obj.id,
+                "track_id": obj.track_id,
+                "color_id": obj.color,
+                "pixel_count": len(obj.pixels),
+                "bbox_yxyx": list(obj.bbox),
+                "reasons": sorted(reasons),
+            })
+        return sorted(
+            candidates,
+            key=lambda item: (
+                "appeared" not in item["reasons"],
+                "changed" not in item["reasons"],
+                item["pixel_count"], item["frame_id"],
+            ),
+        )[:12]
 
     def learn_traversable_colors(
         self,
@@ -2987,6 +3194,63 @@ class MyAgentCore:
         print(
             "[NAV] failed-move memory cleared",
             flush=True,
+        )
+
+    def navigation_topology_changed(self, transition):
+        """Return whether a non-floor gameplay object changed the route map."""
+        if transition is None:
+            return False
+
+        traversable_colors = {
+            color for color, count in self.traversable_color_evidence.items()
+            if count >= 2
+        }
+        target_tracks = {
+            track
+            for tracks in self.goal_target_tracks.values()
+            for track in tracks
+        }
+        ui_tracks = set(self.scene_role_tracks.get("ui_candidates", set()))
+        # Analyses normally populate role tracks immediately. Retain the
+        # previous-frame ID interpretation for callers restoring old state.
+        if not ui_tracks and self.scene_analysis is not None and self.previous_state:
+            ui_ids = set(self.scene_analysis.get("ui_candidates", []))
+            ui_tracks = {
+                obj.track_id for obj in self.previous_state
+                if obj.id in ui_ids and obj.track_id is not None
+            }
+        controlled_footprint = set()
+        for movement in transition.moved_objects:
+            if movement.before.track_id in self.controlled_track_ids:
+                controlled_footprint.update(movement.before.pixels)
+                controlled_footprint.update(movement.after.pixels)
+
+        def affects_navigation(obj):
+            if obj is None or obj.color in traversable_colors:
+                return False
+            if obj.track_id in self.controlled_track_ids:
+                return False
+            if obj.track_id in target_tracks or obj.track_id in ui_tracks:
+                return False
+            return True
+
+        def changed_only_by_player(old, new):
+            return (
+                old.color == new.color
+                and bool(controlled_footprint)
+                and (old.pixels ^ new.pixels) <= controlled_footprint
+            )
+
+        return any(
+            affects_navigation(obj)
+            for obj in transition.appeared_objects + transition.disappeared_objects
+        ) or any(
+            affects_navigation(movement.before) or affects_navigation(movement.after)
+            for movement in transition.moved_objects
+        ) or any(
+            not changed_only_by_player(old, new)
+            and (affects_navigation(old) or affects_navigation(new))
+            for old, new in transition.changed_objects
         )
 
     def request_reanalysis(
@@ -3093,7 +3357,8 @@ class MyAgentCore:
             "bbox": list(obj.bbox),
         }
 
-    def begin_interaction_observation(self, target_region_ids, planned_action=None):
+    def begin_interaction_observation(self, target_region_ids, planned_action=None,
+                                      frame=None):
         """Save the evidence needed to explain the result of one planned move."""
         if self.current_goal is None or self.previous_state is None:
             return None
@@ -3134,6 +3399,12 @@ class MyAgentCore:
             ),
             "ui_tracks": ui_tracks,
             "snapshots": snapshots,
+            "reachable_tracks": (
+                self.reachable_gameplay_tracks(
+                    frame, self.previous_state,
+                    set(self.current_goal["target_tracks"]) | ui_tracks,
+                ) if frame is not None else None
+            ),
         }
 
     def record_mechanics_observation(self, observation):
@@ -3182,7 +3453,8 @@ class MyAgentCore:
             )
         ]
 
-    def observe_pending_interaction(self, objects, movement_succeeded=False):
+    def observe_pending_interaction(self, objects, movement_succeeded=False,
+                                    frame=None):
         pending = self.pending_interaction
         self.pending_interaction = None
         if pending is None:
@@ -3267,6 +3539,10 @@ class MyAgentCore:
                 change for change in changes if change["area"] == "gameplay"
             ],
         }
+        self.post_interaction_candidates = self.derive_post_interaction_candidates(
+            objects, pending, changes, frame,
+        )
+        observation["next_goal_candidates"] = self.post_interaction_candidates
         record = self.record_mechanics_observation(observation)
         print("[INTERACTION EFFECT]", json.dumps(observation), flush=True)
 
@@ -3463,7 +3739,7 @@ class MyAgentCore:
             self.resolve_controlled_ids(objects)
 
         interaction_observation = self.observe_pending_interaction(
-            objects, movement_succeeded=expected_move_seen
+            objects, movement_succeeded=expected_move_seen, frame=frame,
         )
         if interaction_observation is not None:
             new_evidence = True
@@ -3502,7 +3778,8 @@ class MyAgentCore:
                     and old.shape_hash != obj.shape_hash
                     for old, obj in (transition.changed_objects if self.previous_state is not None else [])
                 )
-                if controlled_changed or target_changed:
+                topology_changed = self.navigation_topology_changed(transition)
+                if controlled_changed or target_changed or topology_changed:
                     self.clear_navigation_memory()
                     new_evidence = True
                 new_evidence |= bool(current_pixels) and (
@@ -3764,6 +4041,8 @@ class MyAgentCore:
                 reanalysis_reason=self.reanalysis_reason,
                 tracking_events=self.tracker.events,
                 causal_observations=self.cumulative_mechanics_feedback(),
+                runtime_context=self.runtime_context,
+                post_interaction_candidates=self.post_interaction_candidates,
             )
 
             self.goal_target_tracks = (capture_goal_target_tracks(self.scene_analysis,objects,))
@@ -3903,7 +4182,7 @@ class MyAgentCore:
                             "goal_planner",
                             interaction_context=(
                                 self.begin_interaction_observation(
-                                    target_region_ids, action
+                                    target_region_ids, action, frame=frame,
                                 )
                             ),
                         )
@@ -4068,15 +4347,28 @@ class MyAgentSolver(Solver):
                     break
 
                 state = game.current_state
+                raw_state = state.raw
+                engine_state = getattr(raw_state, "state", None)
+
+                # A completed level/game is terminal evidence. Do not turn a
+                # winning frame into another movement decision or a RESET.
+                if engine_state == getattr(arcengine.GameState, "WIN", object()):
+                    print("[ENGINE WIN] finishing game without another action", flush=True)
+                    break
+
                 level = getattr(state.raw, "levels_completed", None)
                 if previous_level is not None and level is not None and level != previous_level:
                     episode_id += 1
                     agent = MyAgentCore(episode_id)
                 previous_level = level
 
+                set_runtime_context = getattr(agent, "set_runtime_context", None)
+                if set_runtime_context is not None:
+                    set_runtime_context(raw_state, run)
+
                 # Handle engine GAME_OVER.
                 if (
-                    state.raw.state
+                    engine_state
                     == arcengine.GameState.GAME_OVER
                 ):
                     action = (
