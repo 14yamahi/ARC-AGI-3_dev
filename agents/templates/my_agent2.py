@@ -2520,6 +2520,7 @@ small number of actions.
 
 class MyAgentCore:
     MAX_ACTIONS = 20
+    MAX_STALLED_ACTIONS = 6
 
     def __init__(self):
         self.previous_state = None
@@ -2536,6 +2537,8 @@ class MyAgentCore:
         self.traversable_color_evidence = defaultdict(int)
         self.act_steps = 0
         self.act_steps_since_analysis = 0
+        self.actions_without_progress = 0
+        self.best_goal_distances = {}
         self.needs_reanalysis = False
         self.controlled_shape_hashes = set()
         self.goal_target_hashes = {}
@@ -2781,6 +2784,8 @@ class MyAgentCore:
 
     def observe(self, frame):
         frame = np.asarray(frame)
+        new_evidence = False
+        observed_action = False
 
         previous_controlled_ids = set(self.controlled_component_ids)
 
@@ -2802,6 +2807,7 @@ class MyAgentCore:
                     transition,
                 )
             elif self.mode == "ACT":
+                observed_action = self.last_action_state is not None
                 # reanalysis if move was not expected
                 expected_delta = (
                     self.action_vectors.get(
@@ -2831,6 +2837,11 @@ class MyAgentCore:
 
                 if source_state is not None:
 
+                    # A newly tested move is useful even when it is blocked.
+                    new_evidence = (
+                        self.previous_action not in self.tested_actions[source_state]
+                    )
+
                     # We have now experimentally tested this action
                     # from this state.
                     self.tested_actions[source_state].add(
@@ -2852,6 +2863,10 @@ class MyAgentCore:
                         )
 
                         if destination_state:
+                            new_evidence |= (
+                                self.transition_graph[source_state].get(self.previous_action)
+                                != destination_state
+                            )
                             self.transition_graph[
                                 source_state
                             ][self.previous_action] = (
@@ -2906,6 +2921,14 @@ class MyAgentCore:
                 )
             )
 
+            if observed_action:
+                new_evidence |= bool(current_pixels) and (
+                    self.state_visit_counts[current_pixels] == 0
+                )
+                new_evidence = self.record_navigation_progress(
+                    objects, current_pixels, new_evidence
+                )
+
             if current_pixels:
 
                 self.state_visit_counts[
@@ -2914,6 +2937,8 @@ class MyAgentCore:
 
                 # Detect A -> B -> A two-state oscillation.
                 if (
+                    not new_evidence
+                    and
                     len(self.recent_controlled_states) >= 2
                     and current_pixels
                     == self.recent_controlled_states[-2]
@@ -2927,6 +2952,8 @@ class MyAgentCore:
 
                 # More general repeated-state detection.
                 elif (
+                    not new_evidence
+                    and
                     self.state_visit_counts[current_pixels]
                     >= 4
                 ):
@@ -2944,6 +2971,29 @@ class MyAgentCore:
         self.previous_frame = frame.copy()
 
         return objects
+
+    def record_navigation_progress(self, objects, current_pixels, new_evidence):
+        # Only a new best distance counts; approaching after moving away
+        # must not repeatedly reset the stall counter.
+        if self.current_goal is not None and current_pixels:
+            hashes = self.current_goal["target_hashes"]
+            key = (self.current_goal["type"], tuple(sorted(hashes)))
+            target_ids = resolve_goal_target_ids(objects, hashes)
+            target_pixels = get_object_pixels(objects, target_ids)
+            distance = pixel_distance(current_pixels, target_pixels)
+            best = self.best_goal_distances.get(key, float("inf"))
+            if distance < best:
+                self.best_goal_distances[key] = distance
+                new_evidence = True
+
+        if new_evidence:
+            self.actions_without_progress = 0
+        else:
+            self.actions_without_progress += 1
+
+        print("[PROGRESS]", f"new_evidence={new_evidence}",
+              f"stalled_actions={self.actions_without_progress}", flush=True)
+        return new_evidence
 
     def commit_action(
         self,
@@ -2994,19 +3044,18 @@ class MyAgentCore:
             for action, delta in self.action_vectors.items()
             if action in legal_actions
         }
-        # Don't execute one hypothesis indefinitely.
+        # Reconsider only after consecutive actions without useful evidence.
         if (
             self.mode == "ACT"
-            and self.act_steps_since_analysis >= 6
+            and not self.needs_reanalysis
+            and self.actions_without_progress >= self.MAX_STALLED_ACTIONS
         ):
             self.request_reanalysis(
                 reason=(
-                    "six actions executed since analysis "
-                    "without solving the level"
+                    "six consecutive actions without new evidence or goal progress; "
+                    "target not reached, hypothesis remains untested or inconclusive"
                 ),
-                reject_current_goal=(
-                    self.current_goal is not None
-                ),
+                reject_current_goal=False,
             )
 
         # Exploration without an actionable goal
@@ -3014,11 +3063,13 @@ class MyAgentCore:
         if (
             self.mode == "ACT"
             and self.no_goal_steps >= 3
+            and self.actions_without_progress >= 3
+            and not self.needs_reanalysis
         ):
             self.request_reanalysis(
                 reason=(
-                    "three exploration actions taken "
-                    "without an actionable goal"
+                    "exploration without an actionable goal has produced "
+                    "no new evidence for three actions"
                 ),
                 reject_current_goal=False,
             )
@@ -3087,6 +3138,7 @@ class MyAgentCore:
             self.no_goal_steps = 0
             self.needs_reanalysis = False
             self.act_steps_since_analysis = 0
+            self.actions_without_progress = 0
             self.mode = "ACT"
         # -------------------------
         # ACT
