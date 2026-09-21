@@ -50,6 +50,10 @@ class GameObject:
     shape_hash: str
     boundary: list[tuple[int, int]]
     children: list[int]
+    track_id: str | None = None
+    tracking_confidence: float = 0.0
+    tracking_status: str = "untracked"
+    parent_track_ids: tuple[str, ...] = ()
 
 @dataclass
 class Segmentation:
@@ -342,53 +346,182 @@ def group_movements(movements):
 
     return groups
 
-# link objects that moved to the same id
-def match_objects(before, after):
-    MAX_MATCH_DISTANCE = 15
+def maximum_assignment(scores):
+    """Global one-to-one assignment; dummy columns leave tracks unmatched."""
+    if not scores:
+        return []
+    n, real_columns = len(scores), len(scores[0])
+    costs = [[-score for score in row] + [0.0] * n for row in scores]
+    m = real_columns + n
+    u, v = [0.0] * (n + 1), [0.0] * (m + 1)
+    p, way = [0] * (m + 1), [0] * (m + 1)
+    for i in range(1, n + 1):
+        p[0] = i
+        j0 = 0
+        minimum, used = [float('inf')] * (m + 1), [False] * (m + 1)
+        while True:
+            used[j0] = True
+            i0, delta, j1 = p[j0], float('inf'), 0
+            for j in range(1, m + 1):
+                if not used[j]:
+                    cur = costs[i0 - 1][j - 1] - u[i0] - v[j]
+                    if cur < minimum[j]:
+                        minimum[j], way[j] = cur, j0
+                    if minimum[j] < delta:
+                        delta, j1 = minimum[j], j
+            for j in range(m + 1):
+                if used[j]:
+                    u[p[j]] += delta
+                    v[j] -= delta
+                else:
+                    minimum[j] -= delta
+            j0 = j1
+            if p[j0] == 0:
+                break
+        while j0:
+            j1 = way[j0]
+            p[j0] = p[j1]
+            j0 = j1
+    return [(p[j] - 1, j - 1) for j in range(1, real_columns + 1) if p[j]]
 
-    matches = []
-    unmatched_after = set(range(len(after)))
 
-    for old in before:
+class ObjectTracker:
+    """Conservative component tracking; appearance is evidence, not identity."""
+    MIN_SCORE = 0.60
+    AMBIGUITY_MARGIN = 0.08
+    MAX_MISSING = 2
 
-        candidates = []
+    def __init__(self, episode_id=0):
+        self.episode_id = episode_id
+        self.next_id = 0
+        self.tracks = {}
+        self.missing = {}
+        self.retired = set()
+        self.events = []
 
-        for i in unmatched_after:
-            new = after[i]
+    @staticmethod
+    def score(old, new, delta=None, missing=False):
+        predicted = translate_pixels(old.pixels, delta or (0, 0))
+        # A blocked action is also a valid explanation for an unchanged object.
+        overlap = max(
+            len(predicted & new.pixels) / len(predicted | new.pixels),
+            len(old.pixels & new.pixels) / len(old.pixels | new.pixels),
+        )
+        dx, dy = delta or (0, 0)
+        distance = min(
+            abs(old.center[0] + dy - new.center[0]) + abs(old.center[1] + dx - new.center[1]),
+            abs(old.center[0] - new.center[0]) + abs(old.center[1] - new.center[1]),
+        )
+        if distance > 15 or (missing and (old.shape_hash != new.shape_hash or distance > 5)):
+            return -1.0
+        a, b = normalized_shape(old), normalized_shape(new)
+        shape = len(a & b) / len(a | b)
+        size = min(len(a), len(b)) / max(len(a), len(b))
+        appearance = 0.20 * shape + 0.10 * size + 0.10 * (old.color == new.color)
+        return max(0.70 * overlap + 0.30 * size,
+                   appearance + 0.45 * max(0, 1 - distance / 20))
 
-            if old.shape_hash != new.shape_hash:
+    def update(self, objects, controlled_tracks=(), delta=None):
+        self.events = []
+        previous = [obj for key, obj in self.tracks.items()
+                    if key not in self.retired and self.missing[key] <= self.MAX_MISSING]
+        # Detect geometric split/merge groups before one-to-one assignment.
+        overlap_edges = {}
+        for i, old in enumerate(previous):
+            if self.missing[old.track_id]:
                 continue
+            poses = [old.pixels]
+            if old.track_id in controlled_tracks and delta is not None:
+                poses.append(translate_pixels(old.pixels, delta))
+            # A blocked move may still trigger a color/shape transformation.
+            pixels = max(poses, key=lambda pose: max(
+                (len(pose & new.pixels) / len(pose | new.pixels) for new in objects),
+                default=0.0,
+            ))
+            for j, new in enumerate(objects):
+                overlap = len(pixels & new.pixels)
+                if overlap / min(len(pixels), len(new.pixels)) >= 0.8:
+                    overlap_edges[i, j] = overlap
+        lineage_old, lineage_new = set(), {}
+        for i, old in enumerate(previous):
+            children = [j for oi, j in overlap_edges if oi == i
+                        and len(objects[j].pixels) <= 0.8 * len(old.pixels)]
+            if len(children) > 1:
+                area = sum(len(objects[j].pixels) for j in children)
+                coverage = sum(overlap_edges[i, j] for j in children)
+                if 0.8 <= area / len(old.pixels) <= 1.25 and coverage / len(old.pixels) >= 0.8:
+                    lineage_old.add(i)
+                    for j in children:
+                        lineage_new.setdefault(j, set()).add(old.track_id)
+        for j, new in enumerate(objects):
+            parents = [i for i, nj in overlap_edges if nj == j
+                       and len(previous[i].pixels) <= 0.8 * len(new.pixels)]
+            if len(parents) > 1:
+                area = sum(len(previous[i].pixels) for i in parents)
+                coverage = sum(overlap_edges[i, j] for i in parents)
+                if 0.8 <= area / len(new.pixels) <= 1.25 and coverage / len(new.pixels) >= 0.8:
+                    lineage_old.update(parents)
+                    lineage_new.setdefault(j, set()).update(previous[i].track_id for i in parents)
+        scores = [[
+            self.score(old, new, delta if old.track_id in controlled_tracks else None,
+                       bool(self.missing[old.track_id]))
+            if i not in lineage_old and j not in lineage_new else -1.0
+            for j, new in enumerate(objects)] for i, old in enumerate(previous)]
+        matched_old, matched_new, uncertain = set(), set(), set()
+        for i, j in maximum_assignment([
+            [score if score >= self.MIN_SCORE else -1.0 for score in row] for row in scores
+        ]):
+            score = scores[i][j]
+            if score < self.MIN_SCORE:
+                continue
+            competitors = [s for k, s in enumerate(scores[i]) if k != j]
+            competitors += [row[j] for k, row in enumerate(scores) if k != i]
+            if competitors and score - max(competitors) < self.AMBIGUITY_MARGIN:
+                uncertain.add(j)
+                continue
+            objects[j].track_id = previous[i].track_id
+            objects[j].tracking_confidence = score
+            objects[j].tracking_status = 'matched'
+            objects[j].parent_track_ids = previous[i].parent_track_ids
+            matched_old.add(i)
+            matched_new.add(j)
+        for i, old in enumerate(previous):
+            if i in lineage_old:
+                self.retired.add(old.track_id)
+            elif i not in matched_old:
+                self.missing[old.track_id] += 1
+                # Continued ambiguous observations are not an absence. Keep
+                # competing identities alive until evidence separates them.
+                if any(score >= self.MIN_SCORE for score in scores[i]):
+                    self.missing[old.track_id] = min(self.missing[old.track_id], self.MAX_MISSING)
+                self.events.append({'type': 'unresolved', 'track_id': old.track_id})
+        for j, obj in enumerate(objects):
+            if j not in matched_new:
+                # Do not mint a confident replacement for an ambiguous candidate.
+                ambiguous = j in uncertain or any(row[j] >= self.MIN_SCORE for row in scores)
+                if ambiguous and j not in lineage_new:
+                    obj.tracking_status = 'ambiguous'
+                    obj.tracking_confidence = 0.0
+                    continue
+                obj.track_id = f'{self.episode_id}:{self.next_id}'
+                self.next_id += 1
+                obj.tracking_status = 'lineage' if j in lineage_new else 'new'
+                obj.tracking_confidence = 1.0
+                obj.parent_track_ids = tuple(sorted(lineage_new.get(j, ())))
+                if obj.parent_track_ids:
+                    self.events.append({'type': 'split_or_merge', 'track_id': obj.track_id,
+                                        'parent_track_ids': obj.parent_track_ids})
+            self.tracks[obj.track_id] = obj
+            self.missing[obj.track_id] = 0
+        return objects
 
-            distance = (
-                abs(old.center[0] - new.center[0])
-                + abs(old.center[1] - new.center[1])
-            )
 
-            candidates.append((distance, i, new))
-
-        if not candidates:
-            matches.append((old, None))
-            continue
-
-        distance, i, new = min(candidates,key=lambda x: x[0],)
-
-        if distance > MAX_MATCH_DISTANCE:
-            matches.append((old, None))
-            continue
-
-        # We found the corresponding object
-        matches.append((old, new))
-
-        # Do not allow another old object
-        # to match this same new object
-        unmatched_after.remove(i)
-
-    appeared = [
-        after[i]
-        for i in unmatched_after
-    ]
-
-    return matches, appeared
+def match_objects(before, after):
+    by_track = {obj.track_id: obj for obj in after if obj.track_id is not None}
+    matches = [(old, by_track.get(old.track_id) if old.track_id is not None else None)
+               for old in before]
+    matched = {new.id for _, new in matches if new is not None}
+    return matches, [obj for obj in after if obj.id not in matched]
 
 def describe_transition(
     before,
@@ -415,26 +548,24 @@ def describe_transition(
         dy = new.center[0] - old.center[0]
         dx = new.center[1] - old.center[1]
             
-        if old_shape == new_shape:
-            # Same shape translated somewhere.
+        # Position and appearance changes are independent observations.
+        rounded_dx = round(dx)
+        rounded_dy = round(dy)
 
-            rounded_dx = round(dx)
-            rounded_dy = round(dy)
-
-            if (
-                abs(dx - rounded_dx) < 1e-6
-                and abs(dy - rounded_dy) < 1e-6
-                and (rounded_dx != 0 or rounded_dy != 0)
-            ):
-                moved.append(
-                    Movement(
-                        object_id=old.id,
-                        before=old,
-                        after=new,
-                        delta=(rounded_dx, rounded_dy),
-                    )
+        if (
+            abs(dx - rounded_dx) < 1e-6
+            and abs(dy - rounded_dy) < 1e-6
+            and (rounded_dx != 0 or rounded_dy != 0)
+        ):
+            moved.append(
+                Movement(
+                    object_id=old.id,
+                    before=old,
+                    after=new,
+                    delta=(rounded_dx, rounded_dy),
                 )
-        else:
+            )
+        if old_shape != new_shape or old.color != new.color:
             changed.append((old, new))
 
     return Transition(
@@ -890,6 +1021,10 @@ def validate_scene_analysis(
             - controlled_ids
             - ui_ids
         )
+        cleaned_targets = {
+            obj_id for obj_id in cleaned_targets
+            if obj_id in objects_by_id and objects_by_id[obj_id].track_id is not None
+        }
 
         result["target_ids"] = sorted(
             cleaned_targets
@@ -902,8 +1037,8 @@ def validate_scene_analysis(
             result["confidence"] = 0.0
 
             result["evidence"] += (
-                " Targets were removed because "
-                "they were classified as UI."
+                " Targets were removed because they were controlled, UI, "
+                "missing, or ambiguously tracked components."
             )
 
     return analysis
@@ -1474,12 +1609,12 @@ def choose_goal_action_bfs(
 
     return None
 
-def capture_goal_target_hashes(
+def capture_goal_target_tracks(
     scene_analysis,
     objects,):
     if not isinstance(scene_analysis, dict):
         print(
-            "[TARGET HASH WARNING] "
+            "[TARGET TRACK WARNING] "
             "scene_analysis is not a dict:",
             type(scene_analysis).__name__,
             flush=True,
@@ -1493,7 +1628,7 @@ def capture_goal_target_hashes(
 
     if not isinstance(goal_scores, dict):
         print(
-            "[TARGET HASH WARNING] "
+            "[TARGET TRACK WARNING] "
             "goal_scores is not a dict:",
             type(goal_scores).__name__,
             flush=True,
@@ -1511,23 +1646,20 @@ def capture_goal_target_hashes(
         scene_analysis["goal_scores"].items()
     ):
         result[goal_type] = [
-            objects_by_id[obj_id].shape_hash
+            objects_by_id[obj_id].track_id
             for obj_id in goal["target_ids"]
-            if obj_id in objects_by_id
+            if obj_id in objects_by_id and objects_by_id[obj_id].track_id is not None
         ]
 
     return result
 
 def resolve_goal_target_ids(
     objects,
-    target_hashes,):
-    hashes = set(target_hashes)
-
-    return [
-        obj.id
-        for obj in objects
-        if obj.shape_hash in hashes
-    ]
+    target_tracks,):
+    tracks = set(target_tracks)
+    resolved = {obj.track_id: obj.id for obj in objects if obj.track_id in tracks}
+    # Never silently plan against only a subset of an unresolved target group.
+    return [resolved[track] for track in sorted(tracks)] if tracks <= resolved.keys() else []
 
 def controlled_anchor(
     objects,
@@ -1655,6 +1787,10 @@ def inspect_scene(
                 "pixels": len(obj.pixels),
                 "bbox": list(obj.bbox),
                 "shape_hash": obj.shape_hash,
+                "track_id": obj.track_id,
+                "tracking_status": obj.tracking_status,
+                "tracking_confidence": obj.tracking_confidence,
+                "parent_track_ids": list(obj.parent_track_ids),
             }
             for obj in objects
             if obj.id in controlled_components
@@ -1686,6 +1822,10 @@ def inspect_scene(
                 "bbox": list(obj.bbox),
                 "center": list(obj.center),
                 "shape_hash": obj.shape_hash,
+                "track_id": obj.track_id,
+                "tracking_status": obj.tracking_status,
+                "tracking_confidence": obj.tracking_confidence,
+                "parent_track_ids": list(obj.parent_track_ids),
             }
             for obj in selected_objects
         ]
@@ -2087,7 +2227,8 @@ def analyze_scene_vlm(
     controlled_components,
     traversable_color_evidence,
     previous_feedback=None,
-    reanalysis_reason=None,):
+    reanalysis_reason=None,
+    tracking_events=None,):
     image_url = frame_to_data_url(frame)
     controlled_description = [
         {
@@ -2096,6 +2237,10 @@ def analyze_scene_vlm(
                 obj.color
             ],
             "shape_hash": obj.shape_hash,
+            "track_id": obj.track_id,
+            "tracking_status": obj.tracking_status,
+            "tracking_confidence": obj.tracking_confidence,
+            "parent_track_ids": list(obj.parent_track_ids),
             "bbox": list(obj.bbox),
         }
         for obj in objects
@@ -2103,12 +2248,14 @@ def analyze_scene_vlm(
         in controlled_components
     ]
     verified_facts = {
+        "tracking_events": tracking_events or [],
         "frame_shape": list(np.asarray(frame).shape),
         "component_table": {
-            "columns": ["frame_id", "color", "pixel_count", "bbox_yxyx", "shape_hash"],
+            "columns": ["frame_id", "color", "pixel_count", "bbox_yxyx", "shape_hash", "track_id", "tracking_status", "confidence", "parent_track_ids"],
             "rows": [
                 [obj.id, ARC_COLOR_NAMES[obj.color], len(obj.pixels),
-                 list(obj.bbox), obj.shape_hash]
+                 list(obj.bbox), obj.shape_hash, obj.track_id, obj.tracking_status,
+                 obj.tracking_confidence, list(obj.parent_track_ids)]
                 for obj in objects
             ],
         },
@@ -2150,8 +2297,11 @@ They may change after actions.
 
 Do not use frame_id as persistent object identity.
 
-shape_hash is translation-invariant color+shape evidence
-and is more stable across frames.
+track_id represents tracked continuity within this episode. shape_hash only
+represents color and shape; identical objects can share it. Ambiguous components
+have no track_id and must not be selected as targets. Missing tracks are unresolved,
+not automatically collected. Split/merge descendants have fresh IDs with parent_track_ids.
+Use current frame_id values when submitting tool arguments.
 
 Connected components are low-level visual
 components, not necessarily semantic objects.
@@ -2586,7 +2736,8 @@ class MyAgentCore:
     MAX_ACTIONS = 20
     MAX_STALLED_ACTIONS = 6
 
-    def __init__(self):
+    def __init__(self, episode_id=0):
+        self.tracker = ObjectTracker(episode_id)
         self.previous_state = None
         self.previous_action = None
         self.action_effects = {}
@@ -2606,8 +2757,8 @@ class MyAgentCore:
         self.evidence_revision = 0
         self.goal_experiments = {}
         self.needs_reanalysis = False
-        self.controlled_shape_hashes = set()
-        self.goal_target_hashes = {}
+        self.controlled_track_ids = set()
+        self.goal_target_tracks = {}
         self.failed_moves = set()
         self.last_action_state = None
         self.no_goal_steps = 0
@@ -2641,7 +2792,7 @@ class MyAgentCore:
             *component_sets
         )
 
-        self.controlled_component_ids = controlled
+        self.controlled_track_ids = controlled
 
         print(
             "CONTROLLED ENTITY:",
@@ -2698,94 +2849,20 @@ class MyAgentCore:
             dict(self.traversable_color_evidence),
         )
 
-    def track_controlled_entity(
-        self,
-        transition,):
-        if not self.controlled_component_ids:
-            return
-
-        expected_delta = self.action_vectors.get(
-            self.previous_action
-        )
-
-        if expected_delta is None:
-            return
-
-        current_ids = set()
-
-        for movement in transition.moved_objects:
-
-            if (
-                movement.before.id
-                in self.controlled_component_ids
-                and movement.delta == expected_delta
-            ):
-                current_ids.add(
-                    movement.after.id
-                )
-
-        if current_ids:
-            self.controlled_component_ids = current_ids
-
-    def resolve_controlled_ids(
-        self,
-        objects,):
-        if not self.controlled_shape_hashes:
-            return
-
-        matches = [
-            obj
-            for obj in objects
-            if obj.shape_hash
-            in self.controlled_shape_hashes
-        ]
-
-        if len(matches) != len(
-            self.controlled_shape_hashes
-        ):
-            print(
-                "[CONTROLLED RESOLVE WARNING]",
-                "expected hashes:",
-                self.controlled_shape_hashes,
-                "matches:",
-                [
-                    (
-                        obj.id,
-                        obj.shape_hash,
-                    )
-                    for obj in matches
-                ],
-                flush=True,
-            )
-            return
-
-        self.controlled_component_ids = {
-            obj.id
-            for obj in matches
-        }
-
-        print(
-            "[CONTROLLED RESOLVED]",
-            [
-                {
-                    "id": obj.id,
-                    "color": (
-                        ARC_COLOR_NAMES[
-                            obj.color
-                        ]
-                    ),
-                    "hash": obj.shape_hash,
-                    "bbox": obj.bbox,
-                }
-                for obj in matches
-            ],
-            flush=True,
-        )
+    def resolve_controlled_ids(self, objects):
+        self.controlled_component_ids = set(resolve_goal_target_ids(
+            objects, self.controlled_track_ids
+        ))
 
     def clear_navigation_memory(
         self,):
         self.failed_moves.clear()
         self.last_action_state = None
+        self.transition_graph.clear()
+        self.tested_actions.clear()
+        self.blocked_actions.clear()
+        self.state_visit_counts.clear()
+        self.recent_controlled_states.clear()
 
         print(
             "[NAV] failed-move memory cleared",
@@ -2831,11 +2908,11 @@ class MyAgentCore:
     def record_goal_outcome(self, reason, stalled):
         goal = self.current_goal
         interaction = self.goal_interaction(goal["type"])
-        for target_hash in set(goal["target_hashes"]):
-            key = (interaction, target_hash)
+        for target_track in set(goal["target_tracks"]):
+            key = (interaction, target_track)
             record = self.goal_experiments.setdefault(key, {
                 "interaction": interaction,
-                "target_hash": target_hash,
+                "target_track": target_track,
                 "goal_types": [],
                 "stalled_count": 0,
                 "inconclusive_count": 0,
@@ -2851,11 +2928,14 @@ class MyAgentCore:
 
     def goal_memory_penalties(self):
         penalties = {}
-        for goal_type, hashes in self.goal_target_hashes.items():
+        for goal_type, tracks in self.goal_target_tracks.items():
+            if not tracks or not resolve_goal_target_ids(self.previous_state or [], tracks):
+                penalties[goal_type] = None
+                continue
             records = [
-                self.goal_experiments[(self.goal_interaction(goal_type), target_hash)]
-                for target_hash in set(hashes)
-                if (self.goal_interaction(goal_type), target_hash) in self.goal_experiments
+                self.goal_experiments[(self.goal_interaction(goal_type), target_track)]
+                for target_track in set(tracks)
+                if (self.goal_interaction(goal_type), target_track) in self.goal_experiments
             ]
             if any(record["last_stalled_revision"] == self.evidence_revision for record in records):
                 penalties[goal_type] = None
@@ -2891,8 +2971,9 @@ class MyAgentCore:
         )
         self.action_vectors[action] = dominant_delta
         moving_ids = {
-            movement.object_id
+            movement.before.track_id
             for movement in movements
+            if movement.before.track_id is not None
         }
 
         self.action_components[action] = moving_ids
@@ -2910,7 +2991,10 @@ class MyAgentCore:
 
         previous_controlled_ids = set(self.controlled_component_ids)
 
-        objects = extract_objects(frame)
+        objects = self.tracker.update(
+            extract_objects(frame), self.controlled_track_ids,
+            self.action_vectors.get(self.previous_action),
+        )
 
         if (
             self.previous_state is not None
@@ -2956,7 +3040,7 @@ class MyAgentCore:
                 # The state from which the previous action was issued.
                 source_state = self.last_action_state
 
-                if source_state is not None:
+                if source_state and resolve_goal_target_ids(objects, self.controlled_track_ids):
 
                     # A newly tested move is useful even when it is blocked.
                     new_evidence = (
@@ -3003,7 +3087,8 @@ class MyAgentCore:
                                 flush=True,
                             )
 
-                    else:
+                    elif not any(old.track_id in self.controlled_track_ids
+                                 for old, _ in transition.changed_objects):
 
                         self.failed_moves.add(
                             (
@@ -3030,8 +3115,27 @@ class MyAgentCore:
                 transition,
             )
 
-        if self.controlled_shape_hashes:
+        if self.tracker.events:
+            print("[TRACK EVENTS]", self.tracker.events, flush=True)
+        # Transfer the controlled role only across lineage wholly belonging to it.
+        descendants = [obj for obj in objects if obj.parent_track_ids
+                       and set(obj.parent_track_ids) <= self.controlled_track_ids
+                       and obj.tracking_status == "lineage"]
+        replaced = {parent for obj in descendants for parent in obj.parent_track_ids}
+        if replaced:
+            self.controlled_track_ids = (self.controlled_track_ids - replaced) | {
+                obj.track_id for obj in descendants
+            }
+        if self.controlled_track_ids:
             self.resolve_controlled_ids(objects)
+
+        if (self.mode == "ACT" and self.current_goal is not None
+                and not self.needs_reanalysis
+                and not resolve_goal_target_ids(objects, self.current_goal["target_tracks"])):
+            self.request_reanalysis(
+                "target identity unresolved or split/merged; collection is not established",
+                reject_current_goal=False,
+            )
 
         if self.mode == "ACT":
 
@@ -3043,6 +3147,21 @@ class MyAgentCore:
             )
 
             if observed_action:
+                target_tracks = {track for tracks in self.goal_target_tracks.values() for track in tracks}
+                target_changed = any(
+                    old.track_id in target_tracks for old, _ in transition.changed_objects
+                ) or any(set(obj.parent_track_ids) & target_tracks
+                         for obj in objects if obj.tracking_status == "lineage")
+                controlled_changed = any(
+                    obj.tracking_status == "lineage" for obj in descendants
+                ) or any(
+                    obj.track_id in self.controlled_track_ids
+                    and old.shape_hash != obj.shape_hash
+                    for old, obj in (transition.changed_objects if self.previous_state is not None else [])
+                )
+                if controlled_changed or target_changed:
+                    self.clear_navigation_memory()
+                    new_evidence = True
                 new_evidence |= bool(current_pixels) and (
                     self.state_visit_counts[current_pixels] == 0
                 )
@@ -3103,9 +3222,9 @@ class MyAgentCore:
         # Only a new best distance counts; approaching after moving away
         # must not repeatedly reset the stall counter.
         if self.current_goal is not None and current_pixels:
-            hashes = self.current_goal["target_hashes"]
-            key = (self.current_goal["type"], tuple(sorted(hashes)))
-            target_ids = resolve_goal_target_ids(objects, hashes)
+            tracks = self.current_goal["target_tracks"]
+            key = (self.current_goal["type"], tuple(sorted(tracks)))
+            target_ids = resolve_goal_target_ids(objects, tracks)
             target_pixels = get_object_pixels(objects, target_ids)
             distance = pixel_distance(current_pixels, target_pixels)
             best = self.best_goal_distances.get(key, float("inf"))
@@ -3166,6 +3285,22 @@ class MyAgentCore:
         )
 
         objects = self.observe(frame)
+        if self.controlled_track_ids and not self.controlled_component_ids:
+            print("[TRACK] controlled entity unresolved; taking a new observation", flush=True)
+            self.last_action_state = None
+            action = legal_actions[self.action_index % len(legal_actions)]
+            self.action_index += 1
+            self.previous_action = action
+            if all(track in self.tracker.retired or self.tracker.missing.get(track, 0) > self.tracker.MAX_MISSING
+                   for track in self.controlled_track_ids):
+                # Relearn the controlled role without pretending a new object is the old one.
+                self.controlled_track_ids.clear()
+                self.action_vectors.clear()
+                self.action_components.clear()
+                self.current_goal = None
+                self.mode = "DISCOVER"
+                self.clear_navigation_memory()
+            return action
         # Keep learned controls intact; availability can change between frames.
         legal_action_vectors = {
             action: delta
@@ -3207,17 +3342,18 @@ class MyAgentCore:
         if (
             self.mode == "DISCOVER"
             and len(self.action_vectors) >= 4
+            and self.controlled_component_ids
         ):
             print("[MODE] DISCOVER -> ANALYZE",flush=True,)
-            self.controlled_shape_hashes = {
-                obj.shape_hash
+            self.controlled_track_ids = {
+                obj.track_id
                 for obj in objects if obj.id
                 in self.controlled_component_ids
             }
 
             print(
-                "[CONTROLLED SIGNATURES]",
-                self.controlled_shape_hashes,
+                "[CONTROLLED TRACKS]",
+                self.controlled_track_ids,
                 flush=True,
             )
             self.mode = "ANALYZE"
@@ -3253,10 +3389,11 @@ class MyAgentCore:
                 traversable_color_evidence=self.traversable_color_evidence,
                 previous_feedback=self.cumulative_goal_feedback(),
                 reanalysis_reason=self.reanalysis_reason,
+                tracking_events=self.tracker.events,
             )
 
-            self.goal_target_hashes = (capture_goal_target_hashes(self.scene_analysis,objects,))
-            print("[TARGET SIGNATURES]",self.goal_target_hashes,flush=True,)
+            self.goal_target_tracks = (capture_goal_target_tracks(self.scene_analysis,objects,))
+            print("[TARGET TRACKS]",self.goal_target_tracks,flush=True,)
 
             print("\n=== VLM SCENE ANALYSIS ===")
             print(json.dumps(self.scene_analysis,indent=2,))
@@ -3292,12 +3429,12 @@ class MyAgentCore:
             else:
                 self.no_goal_steps = 0
 
-                target_hashes = (self.goal_target_hashes.get(goal["type"],[],))
+                target_tracks = (self.goal_target_tracks.get(goal["type"],[],))
 
                 goal_identity = {
                     "type": goal["type"],
-                    "target_hashes": sorted(
-                        set(target_hashes)
+                    "target_tracks": sorted(
+                        set(target_tracks)
                     ),
                 }
 
@@ -3332,19 +3469,19 @@ class MyAgentCore:
             # -------------------------
             if goal is not None and goal["type"] in SUPPORTED_GOALS:
                 # resolve target ids
-                target_hashes = (self.goal_target_hashes.get(goal["type"],[],))
+                target_tracks = (self.goal_target_tracks.get(goal["type"],[],))
 
                 target_ids = (
                     resolve_goal_target_ids(
                         self.previous_state,
-                        target_hashes,
+                        target_tracks,
                     )
                 )
 
                 print(
                     "[TARGET RESOLVED]",
                     f"type={goal['type']}",
-                    f"hashes={target_hashes}",
+                    f"tracks={target_tracks}",
                     f"current_ids={target_ids}",
                     flush=True,
                 )
@@ -3516,6 +3653,8 @@ class MyAgentSolver(Solver):
 
         agent = MyAgentCore()
         actions_taken = 0
+        episode_id = 0
+        previous_level = None
 
         try:
             while True:
@@ -3538,6 +3677,11 @@ class MyAgentSolver(Solver):
                     break
 
                 state = game.current_state
+                level = getattr(state.raw, "levels_completed", None)
+                if previous_level is not None and level is not None and level != previous_level:
+                    episode_id += 1
+                    agent = MyAgentCore(episode_id)
+                previous_level = level
 
                 # Handle engine GAME_OVER.
                 if (
@@ -3573,6 +3717,10 @@ class MyAgentSolver(Solver):
                 )
 
                 actions_taken += 1
+                if action == arcengine.GameAction.RESET:
+                    episode_id += 1
+                    agent = MyAgentCore(episode_id)
+                    previous_level = None
 
             if (
                 game.game_run is not None
