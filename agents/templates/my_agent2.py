@@ -6,7 +6,7 @@ from typing import Any
 import base64
 import io
 import json
-from openai import OpenAI
+from openai import OpenAI, BadRequestError
 from PIL import Image
 import traceback
 import contextlib
@@ -2103,6 +2103,15 @@ def analyze_scene_vlm(
         in controlled_components
     ]
     verified_facts = {
+        "frame_shape": list(np.asarray(frame).shape),
+        "component_table": {
+            "columns": ["frame_id", "color", "pixel_count", "bbox_yxyx", "shape_hash"],
+            "rows": [
+                [obj.id, ARC_COLOR_NAMES[obj.color], len(obj.pixels),
+                 list(obj.bbox), obj.shape_hash]
+                for obj in objects
+            ],
+        },
         "controlled_components": controlled_description,
         "action_vectors": {
             action.name: list(delta)
@@ -2149,6 +2158,9 @@ components, not necessarily semantic objects.
 
 Use inspect_scene selectively to answer
 specific remaining questions.
+The component table already provides all component IDs, colors, sizes,
+bounding boxes (min_y, min_x, max_y, max_x), and shape hashes.
+Do not request summary or component information already present above.
 
 Prefer comparing several relevant components
 in one inspection rather than inspecting every
@@ -2243,6 +2255,10 @@ small number of actions.
 
     MAX_INSPECTION_STEPS = 6
     MAX_TOTAL_STEPS = 13
+    MAX_NO_TOOL_RESPONSES = 3
+    no_tool_responses = 0
+    submission_only = False
+    forced_tool_choice_supported = True
     for step in range(MAX_TOTAL_STEPS):
         remaining = (MAX_TOTAL_STEPS - step)
         if remaining == 2:
@@ -2253,8 +2269,7 @@ small number of actions.
                         "Only two tool steps remain. "
                         "If the available evidence is "
                         "sufficient, submit now. "
-                        "Otherwise perform at most one "
-                        "final discriminating inspection."
+                        "Call submit_scene_analysis with your best complete analysis."
                     ),
                 }
             )
@@ -2263,27 +2278,31 @@ small number of actions.
             f"[VLM TOOL STEP {step + 1}]",
             flush=True,
         )
-        if step < MAX_INSPECTION_STEPS:
+        if step >= MAX_INSPECTION_STEPS or no_tool_responses >= 2:
+            submission_only = True
+
+        if not submission_only:
             tools = SCENE_TOOLS
-            tool_choice = "auto"
-            enable_thinking = True
+            tool_choice = "required" if no_tool_responses else "auto"
+            enable_thinking = no_tool_responses == 0
         else:
             tools = [SCENE_TOOLS[1]]
-            tool_choice = "auto"
+            tool_choice = {
+                "type": "function",
+                "function": {"name": "submit_scene_analysis"},
+            }
             enable_thinking = False
-            if step == MAX_INSPECTION_STEPS:
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            "Inspection is finished. "
-                            "Call submit_scene_analysis now with your best "
-                            "complete analysis. Do not answer in plain text."
-                        ),
-                    }
-                )
-        response = (
-            client.chat.completions.create(
+            messages.append({
+                "role": "user",
+                "content": (
+                    "Inspection is finished. Call submit_scene_analysis now "
+                    "with your best complete analysis. Do not answer in plain text."
+                ),
+            })
+        if not forced_tool_choice_supported:
+            tool_choice = "auto"
+        try:
+            response = client.chat.completions.create(
                 model=LOCAL_MODEL,
                 messages=messages,
                 tools=tools,
@@ -2296,7 +2315,20 @@ small number of actions.
                     },
                 },
             )
-        )
+        except BadRequestError as exc:
+            # Some local servers only implement automatic tool choice.
+            # Fall back once, within the same bounded request budget.
+            detail = str(exc).lower()
+            if (
+                forced_tool_choice_supported
+                and tool_choice != "auto"
+                and ("tool_choice" in detail or "tool choice" in detail)
+                and any(word in detail for word in ("unsupported", "not supported", "only", "must be"))
+            ):
+                forced_tool_choice_supported = False
+                print("[VLM] forced tool choice unsupported; using bounded auto fallback", flush=True)
+                continue
+            raise
 
         message = (response.choices[0].message)
 
@@ -2311,6 +2343,21 @@ small number of actions.
         tool_calls = (message.tool_calls or [])
 
         print("tool call count:",len(tool_calls),flush=True,)
+
+        if not tool_calls:
+            no_tool_responses += 1
+            print(f"[VLM NO TOOL] {no_tool_responses}/{MAX_NO_TOOL_RESPONSES}", flush=True)
+            if no_tool_responses >= MAX_NO_TOOL_RESPONSES:
+                break
+            # Do not append an empty assistant message or repeat its monologue.
+            messages.append({
+                "role": "user",
+                "content": (
+                    "Your last response made no tool call. Stop deliberating and "
+                    "call inspect_scene for missing evidence or submit_scene_analysis now."
+                ),
+            })
+            continue
 
         assistant_message = {"role": "assistant",}
 
@@ -2389,6 +2436,7 @@ small number of actions.
             # Final submission
             # -------------------------
             if (name == "submit_scene_analysis"):
+                submission_only = True
                 try:
                     return (
                         validate_scene_analysis(
@@ -2431,6 +2479,8 @@ small number of actions.
             # -------------------------
             if name == "inspect_scene":
                 try:
+                    if submission_only:
+                        raise ValueError("Inspection budget closed; call submit_scene_analysis")
                     result = inspect_scene(
                         args=args,
                         frame=frame,
@@ -2481,13 +2531,14 @@ small number of actions.
             )
     print(
         "[VLM ANALYSIS FAILED] "
-        "inspection budget exhausted without "
+        "analysis budget exhausted without "
         "a valid scene submission",
         flush=True,
     )
 
     return {
         "wall_candidates": [],
+        "ui_candidates": [],
         "important_objects": [],
         "goal_scores": {
             "reach_object": {
