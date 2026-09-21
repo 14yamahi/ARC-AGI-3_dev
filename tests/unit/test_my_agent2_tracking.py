@@ -56,6 +56,7 @@ def load_solver():
         'select_primary_goal', 'MyAgentSolver',
         'validate_scene_analysis', 'SceneAnalysisValidationError',
         'detect_ui_candidates',
+        'vlm_frame_id_view',
         'choose_goal_action_bfs', 'choose_frontier_action', 'choose_exploration_action',
         'plan_to_nearest_frontier', 'get_frontier_actions', 'inverse_action',
     }
@@ -476,6 +477,135 @@ class TestPersistentTracking(unittest.TestCase):
         self.assertEqual(result['important_objects'], [target.id])
         self.assertEqual(result['goal_scores']['reach_object']['target_ids'], [target.id])
 
+    def test_validation_rejects_model_declared_obstacle_goal(self):
+        frame = np.full((12, 12), 4, dtype=int)
+        player = obj({(6, 6)}, color=1, frame_id=1)
+        wall = obj({(5, 5), (5, 6)}, color=5, frame_id=2)
+        target = obj({(4, 4)}, color=9, frame_id=3)
+        for item, track in zip((player, wall, target), ('player', 'wall', 'target')):
+            item.track_id = track
+        analysis = {
+            'wall_candidates': [], 'ui_candidates': [],
+            'important_objects': [wall.id, target.id],
+            'object_roles': [
+                {'object_id': wall.id, 'role': 'obstacle', 'confidence': .9, 'evidence': 'blocks route'},
+            ],
+            'goal_scores': {
+                'reach_object': {'target_ids': [wall.id, target.id], 'confidence': .9, 'evidence': ''},
+            },
+        }
+
+        with self.assertRaises(M['SceneAnalysisValidationError']) as raised:
+            M['validate_scene_analysis'](analysis, {player.id}, [player, wall, target], {}, frame)
+
+        self.assertIn(
+            'declared_wall_or_obstacle',
+            raised.exception.feedback['rejected_target_ids']['reach_object'][wall.id],
+        )
+
+    def test_validation_rejects_separate_background_colour_component_goal(self):
+        frame = np.full((12, 12), 4, dtype=int)
+        player = obj({(6, 6)}, color=1, frame_id=1)
+        background_wall = obj({(5, 5)}, color=4, frame_id=2)
+        target = obj({(4, 4)}, color=9, frame_id=3)
+        for item, track in zip((player, background_wall, target), ('player', 'background-wall', 'target')):
+            item.track_id = track
+        analysis = {
+            'wall_candidates': [], 'ui_candidates': [],
+            'important_objects': [background_wall.id, target.id],
+            'goal_scores': {
+                'reach_object': {
+                    'target_ids': [background_wall.id, target.id], 'confidence': .9, 'evidence': '',
+                },
+            },
+        }
+
+        with self.assertRaises(M['SceneAnalysisValidationError']) as raised:
+            M['validate_scene_analysis'](
+                analysis, {player.id}, [player, background_wall, target], {}, frame,
+            )
+
+        self.assertIn(
+            'background_color_component',
+            raised.exception.feedback['rejected_target_ids']['reach_object'][background_wall.id],
+        )
+
+    def test_vlm_context_replaces_tracking_ids_with_current_frame_ids(self):
+        context = {
+            'frame_id': 7,
+            'track_id': 'current',
+            'target_tracks': ['current', 'missing'],
+            'relation': {'display_track': 'current', 'gameplay_track': 'missing'},
+            'parent_track_ids': ['old'],
+            'tracking_status': 'matched',
+        }
+        result = M['vlm_frame_id_view'](context, {'current': 7})
+        self.assertEqual(result['frame_id'], 7)
+        self.assertEqual(result['target_frame_ids'], [7])
+        self.assertEqual(result['target_not_visible_count'], 1)
+        self.assertEqual(result['relation']['display_frame_id'], 7)
+        self.assertNotIn('gameplay_frame_id', result['relation'])
+        self.assertNotIn('track_id', result)
+        self.assertNotIn('parent_track_ids', result)
+
+    def test_inset_widget_inside_edge_panel_is_protected_ui_not_goal(self):
+        frame = np.zeros((64, 64), dtype=int)
+        player = obj({(32, 32)}, color=1, frame_id=1)
+        panel_pixels = {(y, x) for y in range(53, 63) for x in range(1, 11)}
+        panel = obj(panel_pixels, color=5, frame_id=2)
+        # This status pattern is three cells from the outer edge, as in LS20,
+        # so an edge-margin-only detector would wrongly make it a destination.
+        status = obj({(55, 3), (56, 3), (56, 4)}, color=9, frame_id=3)
+        world_goal = obj({(20, 20)}, color=9, frame_id=4)
+        analysis = {
+            'wall_candidates': [], 'ui_candidates': [],
+            'important_objects': [status.id, world_goal.id],
+            'goal_scores': {
+                'reach_object': {
+                    'confidence': .9, 'target_ids': [status.id], 'evidence': 'blue',
+                },
+            },
+        }
+        with self.assertRaises(M['SceneAnalysisValidationError']) as raised:
+            M['validate_scene_analysis'](
+                analysis, {player.id}, [player, panel, status, world_goal], {}, frame,
+            )
+        feedback = raised.exception.feedback
+        self.assertIn(status.id, feedback['deterministic_edge_ui_ids'])
+        self.assertIn('edge_ui_candidate', feedback['rejected_target_ids']['reach_object'][status.id])
+
+    def test_state_display_is_excluded_from_post_interaction_candidates(self):
+        core = M['MyAgentCore']()
+        frame = np.zeros((16, 16), dtype=int)
+        display = obj({(4, 3)}, color=9, frame_id=1)
+        display.track_id = 'display'
+        gameplay = obj({(8, 8)}, color=9, frame_id=2)
+        gameplay.track_id = 'goal'
+        core.state_display_tracks = {'display'}
+        candidates = core.derive_post_interaction_candidates(
+            [display, gameplay],
+            {'target_tracks': (), 'ui_tracks': set(), 'snapshots': {}},
+            [
+                {'track_id': 'display', 'kind': 'changed', 'area': 'gameplay'},
+                {'track_id': 'goal', 'kind': 'changed', 'area': 'gameplay'},
+            ], frame,
+        )
+        self.assertEqual([item['track_id'] for item in candidates], ['goal'])
+
+    def test_screen_anchored_object_requires_repeated_player_motion_before_ui_promotion(self):
+        core = M['MyAgentCore']()
+        frame = np.zeros((20, 20), dtype=int)
+        player = obj({(10, 10)}, color=1, frame_id=1)
+        widget = obj({(4, 4), (4, 5)}, color=9, frame_id=2)
+        player.track_id, widget.track_id = 'player', 'widget'
+        core.controlled_track_ids = {'player'}
+        core.previous_state = [player, widget]
+        core.update_state_display_evidence(frame, [player, widget], True)
+        self.assertNotIn('widget', core.state_display_tracks)
+        core.previous_state = [player, widget]
+        core.update_state_display_evidence(frame, [player, widget], True)
+        self.assertIn('widget', core.state_display_tracks)
+
     def test_failure_memory_does_not_penalize_identical_other_target(self):
         core = M['MyAgentCore']()
         objects = core.tracker.update([obj({(0, 0)}), obj({(0, 10)}, frame_id=1)])
@@ -785,6 +915,11 @@ class TestPersistentTracking(unittest.TestCase):
         core.repeat_activation_plan['phase'] = 'reenter'
         core.confirm_repeat_activation_state([rotated])
         self.assertTrue(core.repeat_activation_plan['persistence_confirmed'])
+        self.assertEqual(first['classification'], 'repeatable_awaiting_relation')
+        # A pattern display alone is not sufficient to revisit its actuator.
+        # A later reanalysis must link it to a real gameplay target.
+        core.repeat_activation_plan['relation_confirmed'] = True
+        core.confirm_repeat_activation_state([rotated])
         self.assertEqual(first['classification'], 'repeatable')
 
         rotated_state, _ = core.interaction_state_signature([rotated], {'switch'})
@@ -814,7 +949,8 @@ class TestPersistentTracking(unittest.TestCase):
         core.repeat_activation_plan = {
             'target_tracks': ('switch',), 'target_region_pixels': frozenset(target.pixels),
             'phase': 'exit', 'reentry_failures': 0,
-            'expected_state_signature': 'state', 'persistence_confirmed': False,
+            'expected_state_signature': 'state', 'persistence_confirmed': True,
+            'relation_confirmed': True,
         }
         self.assertEqual(core.choose_repeat_activation_action(frame, actions), Action.ACTION1)
         self.assertEqual(core.repeat_activation_plan['phase'], 'reenter')
@@ -826,6 +962,186 @@ class TestPersistentTracking(unittest.TestCase):
         self.assertEqual(core.choose_repeat_activation_action(frame, actions), Action.ACTION2)
         self.assertEqual(core.current_goal['target_tracks'], ['switch'])
         self.assertIsNotNone(core.pending_interaction)
+
+    def test_display_change_does_not_reenter_without_goal_relation(self):
+        core = M['MyAgentCore']()
+        frame = np.full((12, 12), 3, dtype=int)
+        player = obj({(4, 5)}, color=1, frame_id=1)
+        target = obj({(5, 5)}, color=0, frame_id=2)
+        player.track_id, target.track_id = 'player', 'cross'
+        core.previous_state = [player, target]
+        core.controlled_track_ids = {'player'}
+        core.controlled_component_ids = {player.id}
+        core.traversable_color_evidence[3] = 2
+        core.repeat_activation_plan = {
+            'target_tracks': ('cross',), 'target_region_pixels': frozenset(target.pixels),
+            'phase': 'reenter', 'reentry_failures': 0,
+            'expected_state_signature': 'state', 'persistence_confirmed': True,
+            'requires_goal_relation': True, 'relation_confirmed': False,
+        }
+        self.assertIsNone(core.choose_repeat_activation_action(
+            frame, {Action.ACTION2: (0, 1)},
+        ))
+        core.goal_target_tracks = {'activate_object': ['cross'], 'reach_object': ['goal']}
+        core.current_goal = {'type': 'activate_object', 'target_tracks': ['cross']}
+        self.assertIsNone(core.goal_memory_penalties()['activate_object'])
+
+    def test_match_pattern_analysis_approves_display_repeat_for_world_target(self):
+        core = M['MyAgentCore']()
+        core.repeat_activation_plan = {
+            'target_tracks': ('cross',), 'requires_goal_relation': True,
+            'relation_confirmed': False,
+        }
+        core.scene_analysis = {
+            'goal_scores': {'match_pattern': {'confidence': .8, 'target_ids': [7]}},
+        }
+        core.goal_target_tracks = {'match_pattern': ['world-goal']}
+        core.interaction_transitions = {
+            ('move_to_target', ('cross',)): {'classification': 'repeatable_pending'},
+        }
+        core.approve_repeat_activation_after_analysis()
+        self.assertTrue(core.repeat_activation_plan['relation_confirmed'])
+        self.assertEqual(
+            core.interaction_transitions[('move_to_target', ('cross',))]['relation_confirmed'],
+            True,
+        )
+
+    def test_gameplay_switch_transition_can_repeat_without_pattern_relation(self):
+        core = M['MyAgentCore']()
+        before = obj({(1, 1)}, color=6, frame_id=1)
+        after = obj({(1, 2)}, color=6, frame_id=1)
+        before.track_id = after.track_id = 'door-state'
+        state, _ = core.interaction_state_signature([before], {'switch'})
+        record = core.record_interaction_transition(
+            [after],
+            {
+                'goal_type': 'activate_object', 'target_tracks': ('switch',),
+                'target_region_pixels': frozenset({(5, 5)}),
+                'state_signature': state,
+                'snapshots': {'door-state': core.snapshot_track(before)},
+            },
+            [{'track_id': 'door-state', 'kind': 'changed', 'area': 'gameplay',
+              'fields': ['bbox']}],
+            {'door-state': after},
+        )
+        self.assertEqual(record['classification'], 'repeatable_pending')
+        self.assertFalse(core.repeat_activation_plan['requires_goal_relation'])
+        self.assertTrue(core.repeat_activation_plan['relation_confirmed'])
+
+    def test_disappearing_observed_target_is_one_shot_not_repeatable(self):
+        core = M['MyAgentCore']()
+        target = obj({(5, 5)}, color=6, frame_id=1)
+        display = obj({(0, 1), (1, 1)}, color=9, frame_id=2)
+        target.track_id, display.track_id = 'cross', 'display'
+        state, _ = core.interaction_state_signature([target, display], {'cross'})
+        record = core.record_interaction_transition(
+            [display],
+            {
+                'goal_type': 'activate_object', 'target_tracks': ('cross',),
+                'target_region_pixels': frozenset(target.pixels),
+                'state_signature': state,
+                'snapshots': {
+                    'cross': core.snapshot_track(target),
+                    'display': core.snapshot_track(display),
+                },
+            },
+            [{'track_id': 'display', 'kind': 'changed', 'area': 'ui',
+              'fields': ['shape_hash']}],
+            {'display': display},
+        )
+        self.assertEqual(record['classification'], 'one_shot_transition')
+        self.assertIsNone(core.repeat_activation_plan)
+
+    def test_untrusted_target_is_planned_to_boundary_not_entered(self):
+        frame = np.zeros((10, 10), dtype=int)
+        player = obj({(5, 3)}, color=1, frame_id=1)
+        target = obj({(5, 4)}, color=5, frame_id=2)
+        action = M['choose_goal_action_bfs'](
+            frame, [player, target], {player.id}, [target.id],
+            {Action.ACTION4: (1, 0)}, {0: 2}, set(),
+            allow_target_overlap=False,
+        )
+        self.assertIsNone(action)  # Already at a legal contact boundary.
+        overlap_action = M['choose_goal_action_bfs'](
+            frame, [player, target], {player.id}, [target.id],
+            {Action.ACTION4: (1, 0)}, {0: 2}, set(),
+            allow_target_overlap=True,
+        )
+        self.assertEqual(overlap_action, Action.ACTION4)
+
+    def test_ambiguous_pattern_hypothesis_does_not_materialize_navigation_goal(self):
+        core = M['MyAgentCore']()
+        left = obj({(2, 2)}, color=9, frame_id=3)
+        right = obj({(2, 8)}, color=9, frame_id=4)
+        left.track_id, right.track_id = 'left', 'right'
+        core.scene_analysis = {
+            'goal_scores': {
+                'reach_object': {'confidence': 0, 'target_ids': [], 'evidence': ''},
+                'match_pattern': {'confidence': .9, 'target_ids': [3, 4], 'evidence': ''},
+            },
+            'pattern_hypothesis': {
+                'condition_status': 'matched',
+                'required_next_step': 'navigate_world_target',
+                'world_pattern_ids': [3, 4], 'navigation_target_ids': [3, 4],
+            },
+        }
+        core.pattern_relation_context = {
+            'gameplay_pattern_clusters': [
+                {'track_ids': ['left']}, {'track_ids': ['right']},
+            ],
+        }
+        core.materialize_pattern_navigation_goal([left, right])
+        self.assertEqual(core.scene_analysis['goal_scores']['reach_object']['target_ids'], [])
+
+    def test_match_pattern_score_is_not_an_executable_goal_without_materialization(self):
+        scene = {
+            'goal_scores': {
+                'match_pattern': {'confidence': .9, 'target_ids': [7]},
+                'reach_object': {'confidence': .2, 'target_ids': [8]},
+                'unknown': {'confidence': .1, 'target_ids': []},
+            },
+        }
+        selected = M['select_primary_goal'](
+            scene, excluded_goal_types={'match_pattern'},
+        )
+        self.assertIsNone(selected)
+
+    def test_pattern_context_uses_changed_compact_shapes_without_raw_pixel_payloads(self):
+        core = M['MyAgentCore']()
+        frame = np.zeros((20, 20), dtype=int)
+        panel = obj({(y, x) for y in range(10) for x in range(10)}, color=5, frame_id=1)
+        display = obj({(2, 2), (2, 3), (3, 2)}, color=9, frame_id=2)
+        unchanged = obj({(4, 2)}, color=9, frame_id=3)
+        goal = obj({(12, 12), (12, 13), (13, 12)}, color=9, frame_id=4)
+        panel.track_id, display.track_id = 'panel', 'display'
+        unchanged.track_id, goal.track_id = 'unchanged', 'goal'
+        core.state_display_tracks = {'panel', 'display', 'unchanged'}
+        core.pattern_display_tracks = {'display'}
+        core.pattern_gameplay_tracks = {'goal'}
+        context = core.build_pattern_relation_context(frame, [panel, display, unchanged, goal])
+        self.assertEqual([item['track_id'] for item in context['state_displays']], ['display'])
+        self.assertEqual(context['gameplay_shape_candidates'][0]['track_id'], 'goal')
+        cluster = context['state_display_clusters'][0]
+        self.assertNotIn('pixels_by_color', cluster)
+        self.assertIn('shape_rle', cluster)
+        self.assertIn('color_counts', cluster)
+        self.assertNotIn('panel', cluster['track_ids'])
+
+    def test_reset_memory_holds_visual_equivalent_goal_after_rebuild(self):
+        memory = {'unsafe_goal_signatures': set(), 'reset_events': []}
+        first = M['MyAgentCore'](0, level_memory=memory)
+        target = obj({(4, 4)}, color=8, frame_id=1)
+        target.track_id = 'danger'
+        first.previous_state = [target]
+        first.current_goal = {'type': 'reach_object', 'target_tracks': ['danger']}
+        first.previous_action = Action.ACTION1
+        first.record_reset_risk()
+        second = M['MyAgentCore'](1, level_memory=memory)
+        replacement = obj({(4, 4)}, color=8, frame_id=9)
+        replacement.track_id = 'replacement'
+        second.previous_state = [replacement]
+        second.goal_target_tracks = {'reach_object': ['replacement']}
+        self.assertIsNone(second.goal_memory_penalties()['reach_object'])
 
     def test_two_no_effect_contacts_stop_repeatable_hypothesis(self):
         core = M['MyAgentCore']()
@@ -1065,6 +1381,7 @@ class TestPersistentTracking(unittest.TestCase):
         self.assertEqual(captured['post_interaction_candidates'], core.post_interaction_candidates)
         self.assertEqual(captured['interaction_transitions'][0]['classification'], 'repeatable')
         self.assertEqual(captured['interaction_transitions'][0]['states_seen'], 2)
+        self.assertIn('state_displays', captured['pattern_relation_context'])
 
     def test_analysis_to_action_uses_track_targets(self):
         core = M['MyAgentCore']()

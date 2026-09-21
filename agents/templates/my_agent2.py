@@ -958,6 +958,15 @@ def normalize_scene_analysis(analysis):
     # mutating the raw model result.
     analysis = dict(analysis)
     analysis["goal_scores"] = goal_scores
+    analysis.setdefault("pattern_hypothesis", {
+        "condition_status": "unknown",
+        "state_display_ids": [],
+        "world_pattern_ids": [],
+        "actuator_ids": [],
+        "navigation_target_ids": [],
+        "required_next_step": "observe",
+        "evidence": "No structured pattern hypothesis supplied.",
+    })
 
     return analysis
 
@@ -1007,6 +1016,15 @@ def validate_scene_analysis(
     # and subsequent frames preserve the same exclusion.
     analysis["ui_candidates"] = sorted(protected_ui_ids)
 
+    hypothesis = analysis.get("pattern_hypothesis", {})
+    if not isinstance(hypothesis, dict):
+        raise TypeError("pattern_hypothesis must be an object")
+    for field in (
+        "state_display_ids", "world_pattern_ids", "actuator_ids",
+        "navigation_target_ids",
+    ):
+        if not isinstance(hypothesis.get(field, []), list):
+            raise TypeError(f"pattern_hypothesis.{field} must be a list")
     # Controlled entity cannot be a wall.
     analysis["wall_candidates"] = [
         obj_id
@@ -1026,6 +1044,57 @@ def validate_scene_analysis(
             not in strongly_traversable_colors
         )
     ]
+
+    # The model's role labels are useful safety evidence.  A component called
+    # an obstacle (or a hazard) cannot also be a movement destination in the
+    # same analysis.  This catches a common failure mode where the model
+    # correctly describes a central wall, then includes its frame ID in a
+    # speculative reach_object goal.
+    declared_obstacle_ids = set(analysis["wall_candidates"])
+    for item in analysis.get("object_roles", []):
+        if (
+            isinstance(item, dict)
+            and item.get("role") in {"obstacle", "hazard"}
+            and item.get("object_id") in objects_by_id
+        ):
+            declared_obstacle_ids.add(item["object_id"])
+
+    # A separate connected component using the modal canvas colour is normally
+    # part of the board geometry (a wall, void, or background island), rather
+    # than an object that can be collected.  This makes the exclusion effective
+    # before the model has confidently named that geometry a wall.
+    background_color_ids = set()
+    if frame is not None and np.asarray(frame).size:
+        colors, counts = np.unique(np.asarray(frame), return_counts=True)
+        background_color = int(colors[np.argmax(counts)])
+        background_color_ids = {
+            obj.id for obj in objects
+            if obj.id not in controlled_ids and obj.color == background_color
+        }
+
+    blocked_world_ids = (
+        controlled_ids | protected_ui_ids | declared_obstacle_ids
+        | background_color_ids
+    )
+    analysis["important_objects"] = [
+        obj_id for obj_id in analysis["important_objects"]
+        if obj_id not in (declared_obstacle_ids | background_color_ids)
+    ]
+
+    # A hypothesis may observe UI, but its world and navigation sides must be
+    # actual navigable gameplay components.  This preserves the UI/display
+    # split and prevents obstacle evidence from becoming a destination.
+    for field in ("world_pattern_ids", "navigation_target_ids"):
+        invalid = set(hypothesis.get(field, [])) & blocked_world_ids
+        if invalid:
+            raise SceneAnalysisValidationError({
+                "error": "Pattern hypothesis selected a protected world component.",
+                "rejected_target_ids": {"pattern_hypothesis": {
+                    obj_id: ["protected_world_component"] for obj_id in sorted(invalid)
+                }},
+                "deterministic_edge_ui_ids": sorted(edge_ui_ids),
+                "background_color_component_ids": sorted(background_color_ids),
+            })
 
     # Exclude controlled components and UI from important objects.
     analysis["important_objects"] = [
@@ -1057,12 +1126,16 @@ def validate_scene_analysis(
                 reasons.append("declared_ui_candidate")
             if obj_id in edge_ui_ids:
                 reasons.append("edge_ui_candidate")
+            if obj_id in declared_obstacle_ids:
+                reasons.append("declared_wall_or_obstacle")
+            if obj_id in background_color_ids:
+                reasons.append("background_color_component")
             if reasons:
                 rejected[obj_id] = reasons
         if rejected:
             rejected_targets[goal_type] = rejected
 
-        cleaned_targets = original_targets - controlled_ids - protected_ui_ids
+        cleaned_targets = original_targets - blocked_world_ids
         cleaned_targets = {
             obj_id for obj_id in cleaned_targets
             if obj_id in objects_by_id and objects_by_id[obj_id].track_id is not None
@@ -1087,10 +1160,12 @@ def validate_scene_analysis(
         raise SceneAnalysisValidationError({
             "error": (
                 "Goal targets included components that cannot be navigated to. "
-                "Submit a new analysis with only current gameplay targets."
+                "Submit a new analysis with only current gameplay targets, never "
+                "a declared obstacle, hazard, wall, or background-colour component."
             ),
             "rejected_target_ids": rejected_targets,
             "deterministic_edge_ui_ids": sorted(edge_ui_ids),
+            "background_color_component_ids": sorted(background_color_ids),
         })
 
     return analysis
@@ -1138,9 +1213,18 @@ def detect_ui_candidates(
     frame,
     objects,
     controlled_ids,):
+    """Return components with deterministic screen-UI evidence.
+
+    A UI display is often inset inside an edge-anchored panel rather than
+    touching the frame itself.  Treating only the panel as UI leaves its
+    icons and state indicators available as accidental navigation targets.
+    Containment by a compact edge panel is a second hard signal; it does not
+    depend on a game-specific colour, shape, or screen layout.
+    """
     height, width = frame.shape
 
-    result = []
+    edge_anchors = []
+    result = set()
 
     for obj in objects:
 
@@ -1164,9 +1248,30 @@ def detect_ui_candidates(
         )
 
         if touches_edge or near_edge:
-            result.append(obj.id)
+            result.add(obj.id)
+            # The full-frame background is usually edge-adjacent too, but it
+            # cannot be a panel that proves its children are UI.
+            if len(obj.pixels) <= (height * width) // 3:
+                edge_anchors.append(obj)
 
-    return result
+    for obj in objects:
+        if obj.id in controlled_ids or obj.id in result:
+            continue
+        if len(obj.pixels) > 256:
+            continue
+        y1, x1, y2, x2 = obj.bbox
+        for panel in edge_anchors:
+            py1, px1, py2, px2 = panel.bbox
+            contained_by_panel = (
+                py1 <= y1 <= y2 <= py2
+                and px1 <= x1 <= x2 <= px2
+                and len(panel.pixels) >= len(obj.pixels)
+            )
+            if contained_by_panel:
+                result.add(obj.id)
+                break
+
+    return sorted(result)
 
 def destination_colors(
     frame,
@@ -1204,7 +1309,8 @@ def destination_colors(
 def select_primary_goal(
     scene_analysis,
     min_confidence=0.25,
-    goal_penalties=None,):
+    goal_penalties=None,
+    excluded_goal_types=(),):
     scores = scene_analysis["goal_scores"]
 
     unknown_confidence = (
@@ -1215,7 +1321,7 @@ def select_primary_goal(
 
     for goal_type, result in scores.items():
 
-        if goal_type == "unknown":
+        if goal_type == "unknown" or goal_type in set(excluded_goal_types):
             continue
 
         if not result["target_ids"]:
@@ -1548,6 +1654,7 @@ def choose_goal_action_bfs(
     action_vectors,
     traversable_color_evidence,
     failed_moves,
+    allow_target_overlap=True,
     max_depth=30,):
     controlled_pixels = get_controlled_pixels(
         objects,
@@ -1578,6 +1685,17 @@ def choose_goal_action_bfs(
 
     height, width = frame.shape
 
+    def contactable(pixels):
+        if pixels & target_pixels:
+            return allow_target_overlap
+        if allow_target_overlap:
+            return False
+        return any(
+            abs(y - ty) + abs(x - tx) == 1
+            for y, x in pixels
+            for ty, tx in target_pixels
+        )
+
     def legal(pixels):
         for y, x in pixels:
 
@@ -1587,9 +1705,14 @@ def choose_goal_action_bfs(
             ):
                 return False
 
-            # Goal may be entered.
+            # Only targets with explicit safe-contact evidence may be
+            # entered.  Unknown/obstacle targets are approached from a legal
+            # boundary cell, preventing the planner from walking through a
+            # wall or hazard just because a model named it as a goal.
             if (y, x) in target_pixels:
-                continue
+                if allow_target_overlap:
+                    continue
+                return False
 
             # Current player's cells are
             # logically vacated floor.
@@ -1612,7 +1735,7 @@ def choose_goal_action_bfs(
 
         pixels, first_action, depth = (queue.popleft())
 
-        if pixels & target_pixels:
+        if contactable(pixels):
             print(
                 "[BFS] path found, "
                 f"first={first_action}",
@@ -1905,10 +2028,6 @@ def inspect_scene(
                 "pixels": len(obj.pixels),
                 "bbox": list(obj.bbox),
                 "shape_hash": obj.shape_hash,
-                "track_id": obj.track_id,
-                "tracking_status": obj.tracking_status,
-                "tracking_confidence": obj.tracking_confidence,
-                "parent_track_ids": list(obj.parent_track_ids),
             }
             for obj in objects
             if obj.id in controlled_components
@@ -1940,10 +2059,6 @@ def inspect_scene(
                 "bbox": list(obj.bbox),
                 "center": list(obj.center),
                 "shape_hash": obj.shape_hash,
-                "track_id": obj.track_id,
-                "tracking_status": obj.tracking_status,
-                "tracking_confidence": obj.tracking_confidence,
-                "parent_track_ids": list(obj.parent_track_ids),
             }
             for obj in selected_objects
         ]
@@ -2206,6 +2321,29 @@ GOAL_RESULT = {
     ],
     "additionalProperties": False,
 }
+PATTERN_HYPOTHESIS = {
+    "type": "object",
+    "properties": {
+        "condition_status": {
+            "type": "string",
+            "enum": ["unknown", "unmatched", "matched"],
+        },
+        "state_display_ids": {"type": "array", "items": {"type": "integer"}},
+        "world_pattern_ids": {"type": "array", "items": {"type": "integer"}},
+        "actuator_ids": {"type": "array", "items": {"type": "integer"}},
+        "navigation_target_ids": {"type": "array", "items": {"type": "integer"}},
+        "required_next_step": {
+            "type": "string",
+            "enum": ["observe", "repeat_actuator", "navigate_world_target"],
+        },
+        "evidence": {"type": "string"},
+    },
+    "required": [
+        "condition_status", "state_display_ids", "world_pattern_ids",
+        "actuator_ids", "navigation_target_ids", "required_next_step", "evidence",
+    ],
+    "additionalProperties": False,
+}
 SCENE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -2279,7 +2417,8 @@ SCENE_SCHEMA = {
                 ],
                 "additionalProperties": False
             }
-        }
+        },
+        "pattern_hypothesis": PATTERN_HYPOTHESIS,
     },
     "required": [
         "wall_candidates",
@@ -2338,6 +2477,55 @@ SCENE_TOOLS = [
     },
 ]
 
+
+def vlm_frame_id_view(value, track_to_frame):
+    """Remove internal tracking identities from analysis-tool context.
+
+    Frame IDs are the only object IDs accepted by the analysis tools.  Keeping
+    tracker IDs in the same prompt made the model spend tool turns translating
+    between two namespaces and occasionally submit the wrong one.  Tracking
+    still remains available to the controller; this function is only the
+    boundary to the VLM.
+    """
+    if isinstance(value, list):
+        return [vlm_frame_id_view(item, track_to_frame) for item in value]
+    if isinstance(value, tuple):
+        return [vlm_frame_id_view(item, track_to_frame) for item in value]
+    if not isinstance(value, dict):
+        return value
+
+    result = {}
+    has_frame_id = "frame_id" in value
+    for key, item in value.items():
+        if key in {"tracking_status", "tracking_confidence", "parent_track_ids"}:
+            continue
+        if key == "track_id":
+            frame_id = track_to_frame.get(item)
+            if frame_id is not None and not has_frame_id:
+                result["frame_id"] = frame_id
+            continue
+        if key == "track_ids":
+            frame_ids = [track_to_frame[track] for track in item if track in track_to_frame]
+            result["frame_ids"] = frame_ids
+            missing = len(item) - len(frame_ids)
+            if missing:
+                result["not_visible_count"] = missing
+            continue
+        if key.endswith("_track"):
+            frame_id = track_to_frame.get(item)
+            if frame_id is not None:
+                result[f"{key[:-6]}_frame_id"] = frame_id
+            continue
+        if key.endswith("_tracks"):
+            frame_ids = [track_to_frame[track] for track in item if track in track_to_frame]
+            result[f"{key[:-7]}_frame_ids"] = frame_ids
+            missing = len(item) - len(frame_ids)
+            if missing:
+                result[f"{key[:-7]}_not_visible_count"] = missing
+            continue
+        result[key] = vlm_frame_id_view(item, track_to_frame)
+    return result
+
 def analyze_scene_vlm(
     frame,
     objects,
@@ -2350,8 +2538,17 @@ def analyze_scene_vlm(
     causal_observations=None,
     runtime_context=None,
     post_interaction_candidates=None,
-    interaction_transitions=None,):
+    interaction_transitions=None,
+    pattern_relation_context=None,):
     image_url = frame_to_data_url(frame)
+    track_to_frame = {
+        obj.track_id: obj.id
+        for obj in objects
+        if obj.track_id is not None
+    }
+    previous_feedback_view = vlm_frame_id_view(
+        previous_feedback or [], track_to_frame,
+    )
     controlled_description = [
         {
             "frame_id": obj.id,
@@ -2359,10 +2556,6 @@ def analyze_scene_vlm(
                 obj.color
             ],
             "shape_hash": obj.shape_hash,
-            "track_id": obj.track_id,
-            "tracking_status": obj.tracking_status,
-            "tracking_confidence": obj.tracking_confidence,
-            "parent_track_ids": list(obj.parent_track_ids),
             "bbox": list(obj.bbox),
         }
         for obj in objects
@@ -2370,18 +2563,26 @@ def analyze_scene_vlm(
         in controlled_components
     ]
     verified_facts = {
-        "runtime_context": runtime_context or {},
-        "post_interaction_candidates": post_interaction_candidates or [],
-        "interaction_transitions": interaction_transitions or [],
-        "tracking_events": tracking_events or [],
-        "causal_observations": causal_observations or [],
+        "runtime_context": vlm_frame_id_view(runtime_context or {}, track_to_frame),
+        "post_interaction_candidates": vlm_frame_id_view(
+            post_interaction_candidates or [], track_to_frame,
+        ),
+        "interaction_transitions": vlm_frame_id_view(
+            interaction_transitions or [], track_to_frame,
+        ),
+        "pattern_relation_context": vlm_frame_id_view(
+            pattern_relation_context or {}, track_to_frame,
+        ),
+        "tracking_events": vlm_frame_id_view(tracking_events or [], track_to_frame),
+        "causal_observations": vlm_frame_id_view(
+            causal_observations or [], track_to_frame,
+        ),
         "frame_shape": list(np.asarray(frame).shape),
         "component_table": {
-            "columns": ["frame_id", "color", "pixel_count", "bbox_yxyx", "shape_hash", "track_id", "tracking_status", "confidence", "parent_track_ids"],
+            "columns": ["frame_id", "color", "pixel_count", "bbox_yxyx", "shape_hash"],
             "rows": [
                 [obj.id, ARC_COLOR_NAMES[obj.color], len(obj.pixels),
-                 list(obj.bbox), obj.shape_hash, obj.track_id, obj.tracking_status,
-                 obj.tracking_confidence, list(obj.parent_track_ids)]
+                 list(obj.bbox), obj.shape_hash]
                 for obj in objects
             ],
         },
@@ -2418,16 +2619,13 @@ Verified experimental facts:
     indent=2,
 )}
 
-Component frame_id values are local to the current frame.
-They may change after actions.
+Every object ID shown in this request and in inspect_scene results is a current
+frame_id. Use those exact current frame_id values in every tool submission.
+Historical observations have been mapped to a current frame_id where that
+component remains visible; not_visible_count means that no current component
+exists for the historical observation. Do not infer or submit an absent ID.
 
-Do not use frame_id as persistent object identity.
-
-track_id represents tracked continuity within this episode. shape_hash only
-represents color and shape; identical objects can share it. Ambiguous components
-have no track_id and must not be selected as targets. Missing tracks are unresolved,
-not automatically collected. Split/merge descendants have fresh IDs with parent_track_ids.
-Use current frame_id values when submitting tool arguments.
+shape_hash represents color and shape only; identical objects can share it.
 
 Connected components are low-level visual
 components, not necessarily semantic objects.
@@ -2467,6 +2665,10 @@ Components listed in edge_ui_candidates are protected from movement-goal
 selection. The validator rejects any submission that targets them, so select
 only current gameplay components away from the screen edge.
 
+Never select a component you classify as an obstacle, hazard, or wall. Also do
+not select a distinct component with the modal canvas/background colour: it is
+board geometry unless later observations provide clear, contradictory evidence.
+
 post_interaction_candidates contains current non-UI gameplay components found
 from an observed change or a newly reachable route. They are hypotheses, not
 confirmed goals. Prefer them over unrelated components and use their current
@@ -2476,6 +2678,28 @@ interaction_transitions records persistent before/after state signatures for
 verified contacts. A repeatable interaction may be useful again only when it
 continues to produce a novel state; a cycle or repeated no-effect result means
 choose another hypothesis.
+
+pattern_relation_context separates non-navigable state_displays from
+gameplay_shape_candidates. After an actuator changes a display, explicitly
+consider whether a display state constrains a non-UI world object or route:
+shapes may correspond under rotation, reflection, recolouring, translation,
+counts, or another visible relation. Deterministic component relations are
+evidence only, not a complete semantic interpretation. If the current display
+appears to match a gameplay goal, submit that non-UI gameplay component under
+match_pattern. Never submit a display itself as a target.
+
+If an interaction transition has requires_goal_relation=true, do not select
+the actuator again merely because the display changed. Select match_pattern
+only when a display-to-world hypothesis supports it; otherwise prefer a
+different reachable gameplay hypothesis or exploration.
+
+When pattern evidence matters, submit pattern_hypothesis. Its world_pattern_ids
+describe the pattern being compared; they are not movement targets. Set
+condition_status to matched only when the current display state satisfies the
+relation and navigation_target_ids names exactly one gameplay_pattern_cluster.
+Use required_next_step=observe when uncertain. Use repeat_actuator only for an
+actuator that remains visible and can be contacted again. Do not use
+match_pattern.target_ids as a destination; it records hypothesis evidence.
 
 The level may require multiple sequential interactions.
 
@@ -2513,7 +2737,7 @@ retry_requires_new_evidence are withheld by the action selector until new
 navigation evidence or measurable progress appears. Changing the goal label
 does not make the same movement experiment new.
 
-{json.dumps(previous_feedback or [], indent=2)}
+{json.dumps(previous_feedback_view, indent=2)}
 
 Reason analysis was requested again:
 
@@ -2890,8 +3114,17 @@ class MyAgentCore:
     MAX_STALLED_ACTIONS = 6
     MAX_DISCOVERY_ACTIONS = 16
 
-    def __init__(self, episode_id=0):
+    def __init__(self, episode_id=0, level_memory=None):
         self.tracker = ObjectTracker(episode_id)
+        # Survives an engine reset within the same level, but is discarded on
+        # level completion.  Store visual signatures rather than frame IDs,
+        # which are recreated after every reset.
+        self.level_memory = level_memory if level_memory is not None else {
+            "unsafe_goal_signatures": set(),
+            "reset_events": [],
+        }
+        self.level_memory.setdefault("unsafe_goal_signatures", set())
+        self.level_memory.setdefault("reset_events", [])
         self.previous_state = None
         self.previous_action = None
         self.action_effects = {}
@@ -2904,6 +3137,14 @@ class MyAgentCore:
         self.scene_analysis = None
         self.runtime_context = {}
         self.post_interaction_candidates = []
+        # Screen-anchored status indicators are useful evidence about state,
+        # but are never movement destinations.  Keep their identities apart
+        # from ordinary UI frame IDs, which are local to one observation.
+        self.state_display_tracks = set()
+        self.state_display_evidence = defaultdict(int)
+        self.pattern_relation_context = {}
+        self.pattern_display_tracks = set()
+        self.pattern_gameplay_tracks = set()
         self.interaction_transitions = {}
         self.repeat_activation_plan = None
         self.scene_role_tracks = {}
@@ -2916,6 +3157,7 @@ class MyAgentCore:
         self.act_steps_since_analysis = 0
         self.actions_without_progress = 0
         self.best_goal_distances = {}
+        self.route_failures = defaultdict(int)
         self.evidence_revision = 0
         self.goal_experiments = {}
         self.pending_interaction = None
@@ -3023,6 +3265,257 @@ class MyAgentCore:
         signature = hashlib.sha1(repr(descriptors).encode()).hexdigest()[:16]
         return signature, descriptors
 
+    def current_state_display_tracks(self, frame, objects):
+        """Resolve state-display identities from confirmed UI evidence.
+
+        The resulting tracks participate in state signatures and causal
+        reasoning, while planner entry points use them as exclusions.  This
+        deliberately does not infer UI from colour or from a single object
+        being small: both occur frequently in gameplay.
+        """
+        tracks = set(self.state_display_tracks)
+        tracks |= set(self.scene_role_tracks.get("ui_candidates", set()))
+        if frame is not None:
+            ui_ids = set(detect_ui_candidates(
+                frame, objects, self.controlled_component_ids,
+            ))
+            tracks |= {
+                obj.track_id for obj in objects
+                if obj.id in ui_ids and obj.track_id is not None
+            }
+        return tracks
+
+    def update_state_display_evidence(self, frame, objects, player_moved):
+        """Promote a soft UI hypothesis only after two player movements.
+
+        This catches inset HUDs without a visible enclosing panel while
+        avoiding a one-frame semantic guess about small world objects.
+        """
+        if not player_moved or self.previous_state is None:
+            return
+        height, width = frame.shape
+        previous_by_track = {
+            obj.track_id: obj for obj in self.previous_state
+            if obj.track_id is not None
+        }
+        for obj in objects:
+            old = previous_by_track.get(obj.track_id)
+            if (
+                old is None
+                or obj.track_id in self.controlled_track_ids
+                or len(obj.pixels) > 128
+            ):
+                continue
+            y1, x1, y2, x2 = obj.bbox
+            near_screen = (
+                y1 <= 5 or x1 <= 5 or y2 >= height - 6 or x2 >= width - 6
+            )
+            if near_screen and old.bbox == obj.bbox:
+                self.state_display_evidence[obj.track_id] += 1
+                if self.state_display_evidence[obj.track_id] >= 2:
+                    self.state_display_tracks.add(obj.track_id)
+            else:
+                self.state_display_evidence.pop(obj.track_id, None)
+
+    @staticmethod
+    def compact_pattern_descriptor(obj):
+        """Serialize a small component for a visual state/goal comparison."""
+        descriptor = {
+            "frame_id": obj.id,
+            "track_id": obj.track_id,
+            "color_id": obj.color,
+            "pixel_count": len(obj.pixels),
+            "bbox_yxyx": list(obj.bbox),
+            "shape_hash": obj.shape_hash,
+        }
+        pixels = normalized_shape(obj)
+        descriptor["shape_dimensions"] = [
+            max(y for y, _ in pixels) + 1,
+            max(x for _, x in pixels) + 1,
+        ]
+        descriptor["shape_rle"] = MyAgentCore.rle_shape(pixels)
+        return descriptor
+
+    @staticmethod
+    def rle_shape(pixels, max_runs=24):
+        """Encode a normalized binary shape without a coordinate-per-pixel list."""
+        runs = []
+        for y in sorted({y for y, _ in pixels}):
+            xs = sorted(x for row, x in pixels if row == y)
+            start = previous = xs[0]
+            for x in xs[1:]:
+                if x == previous + 1:
+                    previous = x
+                    continue
+                runs.append([y, start, previous - start + 1])
+                start = previous = x
+            runs.append([y, start, previous - start + 1])
+            if len(runs) >= max_runs:
+                return runs[:max_runs] + [[-1, -1, -1]]
+        return runs
+
+    def build_pattern_relation_context(self, frame, objects):
+        """Expose possible display-to-world relations without making a guess.
+
+        The VLM receives separate display and gameplay lists, plus only
+        deterministic equal/rotated component relations.  It can therefore
+        hypothesize rotations, reflections, colour mappings, counts, or other
+        state constraints without an UI widget ever becoming a path target.
+        """
+        display_tracks = self.current_state_display_tracks(frame, objects)
+        traversable_colors = {
+            color for color, count in self.traversable_color_evidence.items()
+            if count >= 2
+        }
+        # Panels, borders, bars, and backgrounds explain UI layout but do not
+        # describe its state.  Keep only compact displays that changed in the
+        # last causal observation.
+        changed_display_tracks = self.pattern_display_tracks
+        displays = [
+            obj for obj in objects
+            if (
+                obj.track_id in display_tracks
+                and obj.track_id in changed_display_tracks
+                and len(obj.pixels) <= 64
+            )
+        ]
+        gameplay = [
+            obj for obj in objects
+            if (
+                obj.track_id is not None
+                and obj.track_id not in display_tracks | self.controlled_track_ids
+                and obj.color not in traversable_colors
+                and len(obj.pixels) <= 64
+                and (
+                    not self.pattern_gameplay_tracks
+                    or obj.track_id in self.pattern_gameplay_tracks
+                )
+            )
+        ]
+        relations = []
+        for display in displays:
+            display_shape = frozenset(normalized_shape(display))
+            for target in gameplay:
+                target_shape = frozenset(normalized_shape(target))
+                transform = None
+                if display_shape == target_shape:
+                    transform = "same_shape"
+                else:
+                    for turns, label in (
+                        (1, "rotation_cw_90"),
+                        (2, "rotation_180"),
+                        (3, "rotation_ccw_90"),
+                    ):
+                        if self.rotate_normalized_shape(display_shape, turns) == target_shape:
+                            transform = label
+                            break
+                if transform is not None:
+                    relations.append({
+                        "display_track": display.track_id,
+                        "gameplay_track": target.track_id,
+                        "transform": transform,
+                        "same_color": display.color == target.color,
+                        "display_pixel_count": len(display.pixels),
+                        "gameplay_pixel_count": len(target.pixels),
+                    })
+        return {
+            "state_displays": [self.compact_pattern_descriptor(obj) for obj in displays[:8]],
+            "gameplay_shape_candidates": [
+                self.compact_pattern_descriptor(obj) for obj in gameplay[:16]
+            ],
+            "deterministic_component_relations": relations[:16],
+            "state_display_clusters": self.pattern_clusters(displays),
+            "gameplay_pattern_clusters": self.pattern_clusters(gameplay),
+        }
+
+    @staticmethod
+    def pattern_clusters(objects):
+        """Group compact adjacent components into bounded visual patterns."""
+        remaining = [obj for obj in objects if len(obj.pixels) <= 64]
+        clusters = []
+        while remaining:
+            members = [remaining.pop(0)]
+            changed = True
+            while changed:
+                changed = False
+                for candidate in list(remaining):
+                    if any(bbox_gap(candidate, member) <= 1 for member in members):
+                        members.append(candidate)
+                        remaining.remove(candidate)
+                        changed = True
+            if not members:
+                continue
+            pixels = set().union(*(member.pixels for member in members))
+            min_y = min(y for y, _ in pixels)
+            min_x = min(x for _, x in pixels)
+            clusters.append({
+                "track_ids": sorted(member.track_id for member in members),
+                "frame_ids": sorted(member.id for member in members),
+                "bbox_yxyx": [
+                    min(y for y, _ in pixels), min(x for _, x in pixels),
+                    max(y for y, _ in pixels), max(x for _, x in pixels),
+                ],
+                "pixel_count": len(pixels),
+                "color_counts": {
+                    str(color): sum(
+                        len(member.pixels) for member in members
+                        if member.color == color
+                    )
+                    for color in sorted({member.color for member in members})
+                },
+                "shape_hash": hashlib.sha1(
+                    repr(sorted((y - min_y, x - min_x) for y, x in pixels)).encode()
+                ).hexdigest()[:16],
+                "shape_dimensions": [
+                    max(y for y, _ in pixels) - min_y + 1,
+                    max(x for _, x in pixels) - min_x + 1,
+                ],
+                "shape_rle": MyAgentCore.rle_shape({
+                    (y - min_y, x - min_x) for y, x in pixels
+                }),
+            })
+        return clusters[:12]
+
+    def materialize_pattern_navigation_goal(self, objects):
+        """Turn only a proven pattern condition into a normal world goal."""
+        hypothesis = (self.scene_analysis or {}).get("pattern_hypothesis", {})
+        if (
+            hypothesis.get("condition_status") != "matched"
+            or hypothesis.get("required_next_step") != "navigate_world_target"
+        ):
+            return
+        target_ids = list(hypothesis.get("navigation_target_ids", []))
+        world_ids = set(hypothesis.get("world_pattern_ids", []))
+        if not target_ids or not set(target_ids) <= world_ids:
+            return
+        # The target must name exactly one visual cluster.  A loose list of
+        # unrelated components is evidence to inspect, never a destination.
+        target_tracks = capture_goal_target_tracks(
+            {"goal_scores": {"reach_object": {"target_ids": target_ids}}}, objects,
+        ).get("reach_object", [])
+        clusters = self.pattern_relation_context.get("gameplay_pattern_clusters", [])
+        if not any(set(target_tracks) == set(cluster["track_ids"]) for cluster in clusters):
+            return
+        score = self.scene_analysis["goal_scores"]["match_pattern"]
+        self.scene_analysis["goal_scores"]["reach_object"] = {
+            "confidence": score.get("confidence", 0),
+            "target_ids": target_ids,
+            "evidence": "Pattern condition is matched: " + hypothesis.get("evidence", ""),
+        }
+
+    def goal_allows_overlap(self, goal_type, target_ids):
+        """Require explicit semantics before entering an object's cells."""
+        safe_roles = {"key", "door", "switch", "exit", "collectible", "portal"}
+        roles = {
+            item.get("object_id"): item.get("role")
+            for item in (self.scene_analysis or {}).get("object_roles", [])
+            if isinstance(item, dict)
+        }
+        return bool(target_ids) and all(
+            roles.get(obj_id) in safe_roles
+            for obj_id in target_ids
+        )
+
     def cumulative_interaction_transitions(self):
         return [
             {
@@ -3031,6 +3524,9 @@ class MyAgentCore:
                 "states_seen": len(record["state_signatures"]),
                 "no_effect_count": record["no_effect_count"],
                 "cycle_detected": record["cycle_detected"],
+                "state_display_tracks": sorted(record.get("state_display_tracks", ())),
+                "requires_goal_relation": record.get("requires_goal_relation", False),
+                "relation_confirmed": record.get("relation_confirmed", False),
                 "last_transition": record.get("last_transition"),
             }
             for _, record in sorted(self.interaction_transitions.items())
@@ -3056,7 +3552,7 @@ class MyAgentCore:
         edge_ui_ids = set(detect_ui_candidates(
             frame, objects, self.controlled_component_ids,
         ))
-        ui_tracks = set(self.scene_role_tracks.get("ui_candidates", set())) | {
+        ui_tracks = self.current_state_display_tracks(frame, objects) | {
             obj.track_id for obj in objects
             if obj.id in edge_ui_ids and obj.track_id is not None
         }
@@ -3136,7 +3632,7 @@ class MyAgentCore:
         edge_ui_ids = set(detect_ui_candidates(
             frame, objects, self.controlled_component_ids,
         ))
-        current_ui_tracks = set(self.scene_role_tracks.get("ui_candidates", set())) | {
+        current_ui_tracks = self.current_state_display_tracks(frame, objects) | {
             obj.track_id for obj in objects
             if obj.id in edge_ui_ids and obj.track_id is not None
         }
@@ -3184,6 +3680,9 @@ class MyAgentCore:
             "state_signatures": set(),
             "no_effect_count": 0,
             "cycle_detected": False,
+            "state_display_tracks": set(),
+            "requires_goal_relation": False,
+            "relation_confirmed": False,
         })
         record["state_signatures"].add(before_signature)
         state_changed = before_signature != after_signature
@@ -3206,6 +3705,17 @@ class MyAgentCore:
             "became_reachable" in candidate["reasons"]
             for candidate in self.post_interaction_candidates
         )
+        changed_display_tracks = {
+            change["track_id"] for change in changes
+            if change["area"] == "ui"
+        }
+        record["state_display_tracks"] |= changed_display_tracks
+        # A status display changing is evidence of an actuator->state edge,
+        # not evidence that the actuator should be pressed again.  Gameplay
+        # geometry can safely use the usual route-opening logic; display-only
+        # changes need an explicit relation to a non-UI goal first.
+        requires_goal_relation = bool(changed_display_tracks)
+        record["requires_goal_relation"] |= requires_goal_relation
         prior_seen = after_signature in record["state_signatures"]
         if state_changed:
             record["state_signatures"].add(after_signature)
@@ -3214,7 +3724,29 @@ class MyAgentCore:
             record["no_effect_count"] += 1
         cycle_detected = state_changed and prior_seen
         record["cycle_detected"] |= cycle_detected
-        if state_changed and not cycle_detected and not route_opened:
+        target_disappeared = any(
+            track in pending.get("snapshots", {}) and track not in after
+            for track in target_tracks
+        )
+        # A consumed target cannot be a repeat actuator, even if it changed a
+        # HUD state in the same frame.  Its effect remains causal evidence for
+        # analysis, but re-entry is physically impossible until a later frame
+        # demonstrates that the target has returned.
+        if route_opened:
+            if (
+                self.repeat_activation_plan is not None
+                and tuple(self.repeat_activation_plan["target_tracks"]) == target_tracks
+            ):
+                self.repeat_activation_plan = None
+            record["classification"] = "route_opened"
+        elif target_disappeared:
+            if (
+                self.repeat_activation_plan is not None
+                and tuple(self.repeat_activation_plan["target_tracks"]) == target_tracks
+            ):
+                self.repeat_activation_plan = None
+            record["classification"] = "one_shot_transition"
+        elif state_changed and not cycle_detected and not route_opened:
             record["classification"] = "repeatable_pending"
             self.repeat_activation_plan = {
                 "target_tracks": target_tracks,
@@ -3223,8 +3755,14 @@ class MyAgentCore:
                 "reentry_failures": 0,
                 "expected_state_signature": after_signature,
                 "persistence_confirmed": False,
+                "requires_goal_relation": requires_goal_relation,
+                "relation_confirmed": not requires_goal_relation,
+                "relation_evidence": (
+                    "gameplay state transition" if not requires_goal_relation
+                    else None
+                ),
             }
-        elif cycle_detected or record["no_effect_count"] >= 2 or route_opened:
+        elif cycle_detected or record["no_effect_count"] >= 2:
             if (
                 self.repeat_activation_plan is not None
                 and tuple(self.repeat_activation_plan["target_tracks"]) == target_tracks
@@ -3232,10 +3770,9 @@ class MyAgentCore:
                 self.repeat_activation_plan = None
             record["classification"] = (
                 "state_cycle" if cycle_detected else
-                "stalled" if record["no_effect_count"] >= 2 else
-                "route_opened"
+                "stalled" if record["no_effect_count"] >= 2 else "unknown"
             )
-        elif not state_changed and all(track not in after for track in target_tracks):
+        elif not state_changed and target_disappeared:
             record["classification"] = "consumable_candidate"
         record["last_transition"] = {
             "before_state": before_signature,
@@ -3244,8 +3781,50 @@ class MyAgentCore:
             "target_not_visible": sorted(track for track in target_tracks if track not in after),
             "transforms": rotation_labels,
             "route_opened": route_opened,
+            "changed_state_display_tracks": sorted(changed_display_tracks),
+            "requires_goal_relation": requires_goal_relation,
         }
         return record
+
+    def approve_repeat_activation_after_analysis(self):
+        """Allow re-entry only when analysis links the display to a world goal."""
+        plan = self.repeat_activation_plan
+        if plan is None or not plan.get("requires_goal_relation"):
+            return
+        score = (self.scene_analysis or {}).get("goal_scores", {}).get(
+            "match_pattern", {}
+        )
+        target_tracks = self.goal_target_tracks.get("match_pattern", [])
+        deterministic_relations = [
+            relation for relation in self.pattern_relation_context.get(
+                "deterministic_component_relations", []
+            )
+            if (
+                relation.get("same_color")
+                and min(
+                    relation.get("display_pixel_count", 0),
+                    relation.get("gameplay_pixel_count", 0),
+                ) >= 3
+            )
+        ]
+        if (
+            score.get("confidence", 0) >= 0.35
+            and target_tracks
+        ) or deterministic_relations:
+            plan["relation_confirmed"] = True
+            plan["relation_evidence"] = (
+                "match_pattern hypothesis" if target_tracks
+                else "deterministic display/gameplay shape relation"
+            )
+            key = ("move_to_target", tuple(plan["target_tracks"]))
+            if key in self.interaction_transitions:
+                self.interaction_transitions[key]["relation_confirmed"] = True
+        else:
+            plan["relation_confirmed"] = False
+            # Preserve the plan long enough to leave an overlapping actuator
+            # and verify the state is persistent, but put the actuator itself
+            # on hold so goal selection cannot immediately walk back to it.
+            plan["relation_evidence"] = "awaiting display-to-goal hypothesis"
 
     def confirm_repeat_activation_state(self, objects):
         """Separate an interaction's persistent state change from one-frame animation."""
@@ -3260,7 +3839,10 @@ class MyAgentCore:
         if signature == plan["expected_state_signature"]:
             plan["persistence_confirmed"] = True
             if record is not None:
-                record["classification"] = "repeatable"
+                record["classification"] = (
+                    "repeatable" if plan.get("relation_confirmed", True)
+                    else "repeatable_awaiting_relation"
+                )
             return
         self.repeat_activation_plan = None
         if record is not None:
@@ -3313,6 +3895,11 @@ class MyAgentCore:
             plan["phase"] = "reenter"
             print("[REPEAT ACTUATOR] exiting", action.name, flush=True)
             return self.commit_action(action, "repeat_activation_exit")
+
+        if not plan.get("persistence_confirmed"):
+            return None
+        if not plan.get("relation_confirmed", True):
+            return None
 
         target_ids = resolve_goal_target_ids(
             self.previous_state, plan["target_tracks"],
@@ -3431,6 +4018,12 @@ class MyAgentCore:
             }
             for role in ("wall_candidates", "ui_candidates")
         }
+        # UI role tracks are state displays unless later observations provide
+        # explicit evidence of direct world interaction.  Retain them across
+        # local frame-ID renumbering for planner exclusions and causal traces.
+        self.state_display_tracks |= set(
+            self.scene_role_tracks.get("ui_candidates", set())
+        )
         self.resolve_scene_role_ids(objects)
 
     def resolve_scene_role_ids(self, objects):
@@ -3586,8 +4179,26 @@ class MyAgentCore:
 
     def goal_memory_penalties(self):
         penalties = {}
+        held_repeat_tracks = set()
+        plan = self.repeat_activation_plan
+        if (
+            plan is not None
+            and plan.get("requires_goal_relation")
+            and not plan.get("relation_confirmed")
+        ):
+            held_repeat_tracks = set(plan["target_tracks"])
         for goal_type, tracks in self.goal_target_tracks.items():
+            if held_repeat_tracks and set(tracks) == held_repeat_tracks:
+                # A display-only transition has not established that returning
+                # to this actuator is useful.  Hold the exact same movement
+                # experiment while allowing a newly proposed world target.
+                penalties[goal_type] = None
+                continue
             if not tracks or not resolve_goal_target_ids(self.previous_state or [], tracks):
+                penalties[goal_type] = None
+                continue
+            signatures = self.goal_visual_signatures(tracks)
+            if signatures and signatures <= self.level_memory["unsafe_goal_signatures"]:
                 penalties[goal_type] = None
                 continue
             key = (
@@ -3603,6 +4214,31 @@ class MyAgentCore:
                     for record in records
                 )
         return penalties
+
+    def goal_visual_signatures(self, tracks):
+        by_track = {
+            obj.track_id: obj for obj in (self.previous_state or [])
+            if obj.track_id is not None
+        }
+        return {
+            (by_track[track].color, by_track[track].shape_hash, len(by_track[track].pixels))
+            for track in tracks if track in by_track
+        }
+
+    def record_reset_risk(self):
+        """Remember a target/action experiment that made the player vanish."""
+        if self.current_goal is None:
+            return
+        signatures = self.goal_visual_signatures(self.current_goal["target_tracks"])
+        if not signatures:
+            return
+        self.level_memory["unsafe_goal_signatures"] |= signatures
+        self.level_memory["reset_events"].append({
+            "goal_type": self.current_goal["type"],
+            "signatures": sorted(signatures),
+            "action": getattr(self.previous_action, "name", None),
+        })
+        print("[RESET RISK] retained unsafe target signatures", flush=True)
 
     def cumulative_goal_feedback(self):
         # One entry per target group/interaction, retaining counts rather than an
@@ -3633,11 +4269,16 @@ class MyAgentCore:
             return None
 
         ui_ids = set((self.scene_analysis or {}).get("ui_candidates", []))
+        if frame is not None:
+            ui_ids |= set(detect_ui_candidates(
+                frame, self.previous_state, self.controlled_component_ids,
+            ))
         ui_tracks = {
             obj.track_id
             for obj in self.previous_state
             if obj.id in ui_ids and obj.track_id is not None
         }
+        ui_tracks |= self.current_state_display_tracks(frame, self.previous_state)
         snapshots = {
             obj.track_id: self.snapshot_track(obj)
             for obj in self.previous_state
@@ -3816,6 +4457,39 @@ class MyAgentCore:
             objects, pending, changes, frame,
         )
         observation["next_goal_candidates"] = self.post_interaction_candidates
+        self.pattern_display_tracks = {
+            change["track_id"] for change in changes
+            if change["area"] == "ui" and change["kind"] == "changed"
+        }
+        display_tracks = self.current_state_display_tracks(frame, objects)
+        traversable_colors = {
+            color for color, count in self.traversable_color_evidence.items()
+            if count >= 2
+        }
+        candidate_tracks = {
+            item["track_id"] for item in self.post_interaction_candidates
+        }
+        # When interaction itself did not create a new route, retain compact
+        # world objects as possible pattern counterparts.  Structural objects
+        # and every UI element remain out of this bounded relation payload.
+        self.pattern_gameplay_tracks = candidate_tracks or {
+            obj.track_id for obj in objects
+            if (
+                obj.track_id is not None
+                and obj.track_id not in display_tracks | self.controlled_track_ids
+                and obj.color not in traversable_colors
+                and len(obj.pixels) <= 64
+            )
+        }
+        self.pattern_relation_context = self.build_pattern_relation_context(
+            frame, objects,
+        )
+        observation["state_displays"] = self.pattern_relation_context[
+            "state_displays"
+        ]
+        observation["pattern_relations"] = self.pattern_relation_context[
+            "deterministic_component_relations"
+        ]
         transition_record = self.record_interaction_transition(
             objects, pending, changes, after,
         )
@@ -4016,6 +4690,10 @@ class MyAgentCore:
         if self.controlled_track_ids:
             self.resolve_controlled_ids(objects)
 
+        self.update_state_display_evidence(
+            frame, objects, expected_move_seen,
+        )
+
         self.confirm_repeat_activation_state(objects)
 
         interaction_observation = self.observe_pending_interaction(
@@ -4201,6 +4879,7 @@ class MyAgentCore:
             self.previous_action = action
             if all(track in self.tracker.retired or self.tracker.missing.get(track, 0) > self.tracker.MAX_MISSING
                    for track in self.controlled_track_ids):
+                self.record_reset_risk()
                 # Relearn the controlled role without pretending a new object is the old one.
                 self.controlled_track_ids.clear()
                 self.action_vectors.clear()
@@ -4295,6 +4974,9 @@ class MyAgentCore:
         # ANALYZE
         # -------------------------
         if self.mode == "ANALYZE":
+            self.pattern_relation_context = self.build_pattern_relation_context(
+                np.asarray(frame), objects,
+            )
             print(
                 "[ANALYSIS CONTEXT]",
                 "reason=",
@@ -4324,10 +5006,13 @@ class MyAgentCore:
                 runtime_context=self.runtime_context,
                 post_interaction_candidates=self.post_interaction_candidates,
                 interaction_transitions=self.cumulative_interaction_transitions(),
+                pattern_relation_context=self.pattern_relation_context,
             )
 
+            self.materialize_pattern_navigation_goal(objects)
             self.goal_target_tracks = (capture_goal_target_tracks(self.scene_analysis,objects,))
             self.capture_scene_role_tracks(objects)
+            self.approve_repeat_activation_after_analysis()
             print("[TARGET TRACKS]",self.goal_target_tracks,flush=True,)
 
             print("\n=== VLM SCENE ANALYSIS ===")
@@ -4354,6 +5039,7 @@ class MyAgentCore:
             goal = select_primary_goal(
                 self.scene_analysis,
                 goal_penalties=self.goal_memory_penalties(),
+                excluded_goal_types={"match_pattern"},
             )
           
             if goal is None:
@@ -4389,6 +5075,9 @@ class MyAgentCore:
 
                     self.current_goal = goal_identity
                     self.current_goal_steps = 0
+                    self.route_failures[(
+                        goal_identity["type"], tuple(goal_identity["target_tracks"])
+                    )] = 0
 
                 else:
                     self.current_goal_steps += 1
@@ -4402,7 +5091,7 @@ class MyAgentCore:
                 "reach_object",
                 "move_into_region",
                 "activate_object",
-                "collect_objects"
+                "collect_objects",
             }
 
             # -------------------------
@@ -4461,9 +5150,15 @@ class MyAgentCore:
                         action_vectors=legal_action_vectors,
                         failed_moves=(self.failed_moves),
                         traversable_color_evidence=(self.traversable_color_evidence),
+                        allow_target_overlap=self.goal_allows_overlap(
+                            goal["type"], target_ids,
+                        ),
                     )
                     
                     if action is not None:
+                        self.route_failures[(
+                            goal["type"], tuple(sorted(target_tracks)),
+                        )] = 0
                         return self.commit_action(
                             action,
                             "goal_planner",
@@ -4475,11 +5170,19 @@ class MyAgentCore:
                         )
                     
                     if action is None:
+                        route_key = (goal["type"], tuple(sorted(target_tracks)))
+                        self.route_failures[route_key] += 1
                         print(
                             "[BFS] no verified route to current target; "
                             "keeping current goal and exploring",
                             flush=True,
                         )
+                        if self.route_failures[route_key] >= 2:
+                            self.request_reanalysis(
+                                "no verified safe route after repeated attempts; "
+                                "hold this target and inspect another mechanism",
+                                reject_current_goal=True,
+                            )
                         action = choose_frontier_action(
                             objects=self.previous_state,
                             controlled_ids=(self.controlled_component_ids),
@@ -4608,7 +5311,20 @@ class MyAgentSolver(Solver):
         game: taaf.game.Game,
     ) -> None:
 
-        agent = MyAgentCore()
+        level_memory = {
+            "unsafe_goal_signatures": set(),
+            "reset_events": [],
+        }
+
+        def make_agent(episode):
+            # Test doubles and third-party subclasses may still expose the
+            # original episode-only constructor.
+            try:
+                return MyAgentCore(episode, level_memory=level_memory)
+            except TypeError:
+                return MyAgentCore(episode)
+
+        agent = make_agent(0)
         actions_taken = 0
         episode_id = 0
         previous_level = None
@@ -4646,7 +5362,11 @@ class MyAgentSolver(Solver):
                 level = getattr(state.raw, "levels_completed", None)
                 if previous_level is not None and level is not None and level != previous_level:
                     episode_id += 1
-                    agent = MyAgentCore(episode_id)
+                    level_memory = {
+                        "unsafe_goal_signatures": set(),
+                        "reset_events": [],
+                    }
+                    agent = make_agent(episode_id)
                 previous_level = level
 
                 set_runtime_context = getattr(agent, "set_runtime_context", None)
@@ -4658,6 +5378,9 @@ class MyAgentSolver(Solver):
                     engine_state
                     == arcengine.GameState.GAME_OVER
                 ):
+                    record_reset_risk = getattr(agent, "record_reset_risk", None)
+                    if record_reset_risk is not None:
+                        record_reset_risk()
                     action = (
                         arcengine.GameAction.RESET
                     )
@@ -4689,7 +5412,7 @@ class MyAgentSolver(Solver):
                 actions_taken += 1
                 if action == arcengine.GameAction.RESET:
                     episode_id += 1
-                    agent = MyAgentCore(episode_id)
+                    agent = make_agent(episode_id)
                     previous_level = None
 
             if (
