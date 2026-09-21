@@ -3005,42 +3005,48 @@ class MyAgentCore:
                     current_pixels
                 ] += 1
 
-                # Detect A -> B -> A two-state oscillation.
-                if (
-                    not new_evidence
-                    and
-                    len(self.recent_controlled_states) >= 2
-                    and current_pixels
-                    == self.recent_controlled_states[-2]
-                ):
-                    self.request_reanalysis(
-                        reason="two-state movement loop detected",
-                        reject_current_goal=(
-                            self.current_goal is not None
-                        ),
-                    )
-
-                # More general repeated-state detection.
-                elif (
-                    not new_evidence
-                    and
-                    self.state_visit_counts[current_pixels]
-                    >= 4
-                ):
-                    self.request_reanalysis(
-                        reason="controlled state visited repeatedly",
-                        reject_current_goal=(
-                            self.current_goal is not None
-                        ),
-                    )
-
-                self.recent_controlled_states.append(
-                    current_pixels
-                )
+                if observed_action:
+                    self.check_navigation_loop(current_pixels, new_evidence)
         self.previous_state = objects
         self.previous_frame = frame.copy()
 
         return objects
+
+    def check_navigation_loop(self, current_pixels, new_evidence):
+        # New experiments/progress break a no-progress sequence, including
+        # testing a different blocked action while remaining in place.
+        if new_evidence:
+            self.recent_controlled_states.clear()
+
+        recent = self.recent_controlled_states
+        reason = None
+        reject_goal = False
+        if not new_evidence and not self.needs_reanalysis:
+            if (
+                len(recent) >= 2
+                and current_pixels == recent[-2]
+                and current_pixels != recent[-1]
+                and self.actions_without_progress >= 2
+            ):
+                reason = "two-state movement loop detected"
+                reject_goal = self.current_goal is not None
+            elif (
+                len(recent) >= 2
+                and current_pixels == recent[-1] == recent[-2]
+                and self.actions_without_progress >= 3
+            ):
+                # Repeated blocked moves do not disprove the target hypothesis.
+                reason = "repeated stationary actions without new evidence"
+            elif (
+                recent.count(current_pixels) >= 2
+                and self.actions_without_progress >= 3
+            ):
+                reason = "controlled state repeated within recent no-progress window"
+                reject_goal = self.current_goal is not None
+
+        recent.append(current_pixels)
+        if reason is not None:
+            self.request_reanalysis(reason, reject_current_goal=reject_goal)
 
     def record_navigation_progress(self, objects, current_pixels, new_evidence):
         # Only a new best distance counts; approaching after moving away
