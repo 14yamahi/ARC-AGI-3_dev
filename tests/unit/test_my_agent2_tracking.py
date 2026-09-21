@@ -6,6 +6,7 @@ Kaggle imports. The production implementations themselves are exercised.
 import ast
 import asyncio
 import contextlib
+import __future__
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from enum import Enum
@@ -63,8 +64,21 @@ def load_solver():
                      taaf=SimpleNamespace(game=SimpleNamespace(Game=object)), Solver=object,
                      asyncio=asyncio, json=json, contextlib=contextlib, traceback=traceback)
     namespace['normalize_scene_analysis'] = lambda analysis: analysis
-    exec(compile(ast.Module(body=[n for n in tree.body if getattr(n, 'name', None) in names],
-                            type_ignores=[]), str(path), 'exec'), namespace)
+    selected = ast.Module(
+        body=[n for n in tree.body if getattr(n, 'name', None) in names],
+        type_ignores=[],
+    )
+    # The local test environment may be Python 3.8. Compile the extracted
+    # definitions with PEP 563 semantics so modern annotations such as
+    # set[tuple[int, int]] are never evaluated at runtime.
+    code = compile(
+        selected,
+        str(path),
+        'exec',
+        flags=__future__.annotations.compiler_flag,
+        dont_inherit=True,
+    )
+    exec(code, namespace)
     return namespace
 
 
