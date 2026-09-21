@@ -2821,6 +2821,7 @@ small number of actions.
 class MyAgentCore:
     MAX_ACTIONS = 20
     MAX_STALLED_ACTIONS = 6
+    MAX_DISCOVERY_ACTIONS = 16
 
     def __init__(self, episode_id=0):
         self.tracker = ObjectTracker(episode_id)
@@ -2829,6 +2830,9 @@ class MyAgentCore:
         self.action_effects = {}
         self.controlled_object_id = None
         self.action_index = 0
+        self.discovery_steps = 0
+        self.discovery_attempts = defaultdict(int)
+        self.discovery_state_attempts = defaultdict(int)
         self.action_vectors = {}
         self.scene_analysis = None
         self.action_components = {}
@@ -2869,7 +2873,7 @@ class MyAgentCore:
         
 
     def infer_controlled_entity(self):
-        if len(self.action_components) < 4:
+        if not self.action_components:
             return
 
         component_sets = list(
@@ -3602,7 +3606,8 @@ class MyAgentCore:
         )
 
         objects = self.observe(frame)
-        if self.controlled_track_ids and not self.controlled_component_ids:
+        if (self.mode != "DISCOVER" and self.controlled_track_ids
+                and not self.controlled_component_ids):
             print("[TRACK] controlled entity unresolved; taking a new observation", flush=True)
             self.last_action_state = None
             action = legal_actions[self.action_index % len(legal_actions)]
@@ -3616,6 +3621,9 @@ class MyAgentCore:
                 self.action_components.clear()
                 self.current_goal = None
                 self.mode = "DISCOVER"
+                self.discovery_steps = 0
+                self.discovery_attempts.clear()
+                self.discovery_state_attempts.clear()
                 self.clear_navigation_memory()
             return action
         # Keep learned controls intact; availability can change between frames.
@@ -3656,10 +3664,19 @@ class MyAgentCore:
         # -------------------------
         # DISCOVER -> ANALYZE
         # -------------------------
+        discovery_actions = [action for action in (
+            arcengine.GameAction.ACTION1, arcengine.GameAction.ACTION2,
+            arcengine.GameAction.ACTION3, arcengine.GameAction.ACTION4,
+        ) if action in legal_actions]
+        discovery_complete = (
+            bool(discovery_actions)
+            and all(action in self.action_vectors for action in discovery_actions)
+            and bool(self.controlled_component_ids)
+        )
+        discovery_exhausted = self.discovery_steps >= self.MAX_DISCOVERY_ACTIONS
         if (
             self.mode == "DISCOVER"
-            and len(self.action_vectors) >= 4
-            and self.controlled_component_ids
+            and (discovery_complete or discovery_exhausted)
         ):
             print("[MODE] DISCOVER -> ANALYZE",flush=True,)
             self.controlled_track_ids = {
@@ -3674,6 +3691,11 @@ class MyAgentCore:
                 flush=True,
             )
             self.mode = "ANALYZE"
+            if discovery_exhausted:
+                self.reanalysis_reason = (
+                    "Discovery action budget exhausted; analyze with partial "
+                    "movement evidence. Missing controls may be blocked or non-movement."
+                )
         # -------------------------
         # ACT -> ANALYZE
         # -------------------------
@@ -3933,29 +3955,21 @@ class MyAgentCore:
             return self.commit_action(fallback_action,"absolute_fallback",)
         
         if self.mode == "DISCOVER":
-
-            actions = [
-                arcengine.GameAction.ACTION1,
-                arcengine.GameAction.ACTION2,
-                arcengine.GameAction.ACTION3,
-                arcengine.GameAction.ACTION4,
-            ]
-
-            # Only use currently legal actions.
-            actions = [
-                action
-                for action in actions
-                if action in legal_actions
-            ]
-
-            if not actions:
-                self.previous_action = fallback_action
-                return fallback_action
-
-            action = actions[
-                self.action_index % len(actions)
-            ]
-
+            # Probe each observed board, not a fixed cycle that keeps undoing
+            # itself. Prefer continuing or turning over a learned reversal;
+            # per-board counts still force alternatives when a move is blocked.
+            actions = discovery_actions or [fallback_action]
+            board = np.asarray(frame)
+            state_key = (board.shape, board.dtype.str, board.tobytes())
+            reverse = inverse_action(self.previous_action, self.action_vectors)
+            action = min(actions, key=lambda candidate: (
+                self.discovery_state_attempts[state_key, candidate],
+                candidate == reverse,
+                self.discovery_attempts[candidate],
+            ))
+            self.discovery_state_attempts[state_key, action] += 1
+            self.discovery_attempts[action] += 1
+            self.discovery_steps += 1
             self.action_index += 1
             self.previous_action = action
 

@@ -11,6 +11,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from enum import Enum
 import hashlib
+import io
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -95,6 +96,80 @@ def obj(pixels, color=1, frame_id=0):
 
 
 class TestPersistentTracking(unittest.TestCase):
+    def run_discovery(self, available, deltas):
+        core = M['MyAgentCore']()
+        position = (8, 8)
+        analysis = {
+            'wall_candidates': [], 'ui_candidates': [], 'important_objects': [],
+            'goal_scores': {'unknown': {'confidence': 1, 'target_ids': []}},
+        }
+        with contextlib.redirect_stdout(io.StringIO()), patch.dict(
+            M, analyze_scene_vlm=lambda **kwargs: analysis,
+        ):
+            for _ in range(core.MAX_DISCOVERY_ACTIONS + 1):
+                frame = np.zeros((20, 20), dtype=int)
+                y, x = position
+                frame[y:y+2, x:x+2] = 1
+                action = core.choose_action(frame, available)
+                self.assertIn(action.value, available)
+                if core.mode != 'DISCOVER':
+                    break
+                dx, dy = deltas.get(action, (0, 0))
+                position = (max(1, min(17, y + dy)), max(1, min(17, x + dx)))
+        return core
+
+    def test_discovery_finishes_with_one_or_two_controls(self):
+        for available, deltas in (
+            ([4], {Action.ACTION4: (2, 0)}),
+            ([3, 4], {Action.ACTION3: (-2, 0), Action.ACTION4: (2, 0)}),
+        ):
+            with self.subTest(available=available):
+                core = self.run_discovery(available, deltas)
+                self.assertEqual(core.mode, 'ACT')
+                self.assertLess(core.discovery_steps, core.MAX_DISCOVERY_ACTIONS)
+                self.assertEqual(len(core.controlled_component_ids), 1)
+                self.assertEqual(set(core.action_vectors), set(deltas))
+
+    def test_discovery_budget_accepts_blocked_directions(self):
+        core = self.run_discovery(
+            [1, 2, 3, 4], {Action.ACTION3: (-2, 0), Action.ACTION4: (2, 0)},
+        )
+        self.assertEqual(core.mode, 'ACT')
+        self.assertEqual(core.discovery_steps, core.MAX_DISCOVERY_ACTIONS)
+        self.assertEqual(len(core.controlled_component_ids), 1)
+        self.assertEqual(set(core.action_vectors), {Action.ACTION3, Action.ACTION4})
+
+    def test_discovery_budget_finishes_without_movement_evidence(self):
+        core = self.run_discovery([1, 2, 3, 4], {})
+        self.assertEqual(core.mode, 'ACT')
+        self.assertEqual(core.discovery_steps, core.MAX_DISCOVERY_ACTIONS)
+        self.assertFalse(core.controlled_component_ids)
+        self.assertFalse(core.action_vectors)
+        self.assertEqual(set(core.discovery_attempts), set(list(Action)[1:]))
+
+    def test_discovery_prefers_continuation_over_learned_reverse(self):
+        core = M['MyAgentCore']()
+        frame = np.zeros((12, 12), dtype=int)
+        frame[4:6, 4:6] = 1
+        core.action_vectors = {Action.ACTION1: (0, -2), Action.ACTION2: (0, 2)}
+        core.previous_action = Action.ACTION1
+        # Leave other available controls unknown so discovery remains active.
+        action = core.choose_action(frame, [1, 2, 3, 4])
+        self.assertEqual(action, Action.ACTION1)
+
+    def test_discovery_budget_applies_to_unresolved_controlled_track(self):
+        core = M['MyAgentCore']()
+        core.controlled_track_ids = {'missing'}
+        core.discovery_steps = core.MAX_DISCOVERY_ACTIONS
+        analysis = {'wall_candidates': [], 'ui_candidates': [],
+                    'goal_scores': {'unknown': {'confidence': 1, 'target_ids': []}}}
+        with contextlib.redirect_stdout(io.StringIO()), patch.dict(
+            M, analyze_scene_vlm=lambda **kwargs: analysis,
+        ):
+            core.choose_action(np.zeros((4, 4), dtype=int), [1])
+        self.assertEqual(core.mode, 'ACT')
+        self.assertFalse(core.controlled_track_ids)
+
     def test_numeric_action_ids_use_engine_lookup(self):
         with self.assertRaises(ValueError):
             Action(0)
