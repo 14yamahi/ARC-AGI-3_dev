@@ -8,6 +8,8 @@ import io
 import json
 from openai import OpenAI
 from PIL import Image
+import traceback
+import contextlib
 
 # used for local runs w/ gpt API
 # from agents.agent import Agent
@@ -177,8 +179,7 @@ ARC_COLOR_NAMES = {
 
 def frame_to_data_url(
     frame,
-    save_path=None
-):
+    save_path=None):
     frame = np.asarray(frame)
 
     h, w = frame.shape
@@ -223,8 +224,7 @@ def frame_to_data_url(
 
 def object_hash(
     pixels: set[tuple[int, int]],
-    color: int,
-) -> str:
+    color: int,) -> str:
 
     min_y = min(y for y, x in pixels)
     min_x = min(x for y, x in pixels)
@@ -455,6 +455,78 @@ def normalized_shape(obj):
         for y, x in obj.pixels
     )
 
+def normalize_object_ids(value):
+    # Missing object_ids
+    if value is None:
+        return []
+
+    # Correct format already
+    if isinstance(value, list):
+        return [
+            int(x)
+            for x in value
+            if isinstance(x, (int, float))
+        ]
+
+    # Single ID accidentally returned
+    if isinstance(value, (int, float)):
+        return [int(value)]
+
+    # Stringified list:
+    # "[7, 8, 9]"
+    if isinstance(value, str):
+
+        text = value.strip()
+
+        if not text:
+            return []
+
+        # First try proper JSON decoding.
+        try:
+            decoded = json.loads(text)
+
+            if decoded != value:
+                return normalize_object_ids(
+                    decoded
+                )
+
+        except json.JSONDecodeError:
+            pass
+
+        # Fallback for things like:
+        # "7, 8, 9"
+        # "[7 8 9]"
+        import re
+
+        matches = re.findall(
+            r"-?\d+",
+            text,
+        )
+
+        if matches:
+            normalized = [
+                int(x)
+                for x in matches
+            ]
+
+            print(
+                "[TOOL NORMALIZE] "
+                f"object_ids {value!r} "
+                f"-> {normalized}",
+                flush=True,
+            )
+
+            return normalized
+
+        raise ValueError(
+            f"Could not parse object_ids: {value!r}"
+        )
+
+    raise TypeError(
+        "object_ids must be list, integer, "
+        f"or string; got {type(value).__name__}"
+    )
+
 def bbox_contains(outer, inner):
     oy1, ox1, oy2, ox2 = outer.bbox
     iy1, ix1, iy2, ix2 = inner.bbox
@@ -474,8 +546,7 @@ def bbox_area(obj):
     )
 
 def generate_containment_relationships(
-    objects: list[GameObject],
-) -> list[SpatialRelation]:
+    objects: list[GameObject],) -> list[SpatialRelation]:
 
     relationships = []
 
@@ -508,16 +579,253 @@ def analyze_scene(
     frame,
     objects,
     controlled_entity,
-    action_vectors,
-) -> SceneModel:
+    action_vectors,) -> SceneModel:
     return None
+
+EXPECTED_GOAL_TYPES = {
+    "reach_object",
+    "match_pattern",
+    "collect_objects",
+    "activate_object",
+    "move_into_region",
+    "transform_shape",
+    "unknown",
+}
+
+
+def normalize_scene_analysis(analysis):
+    if not isinstance(analysis, dict):
+        raise TypeError(
+            f"scene analysis must be dict, got {type(analysis).__name__}"
+        )
+
+    # -------------------------------------------------
+    # Repair malformed form produced by some local VLMs:
+    #
+    # {
+    #   "goal_scores":
+    #       "{\"reach_object\": {...},
+    #          \"important_objects\": [...],
+    #          \"wall_candidates\": [...]}"
+    # }
+    #
+    # In that case the string is actually the COMPLETE
+    # scene object, not just goal_scores.
+    # -------------------------------------------------
+    if (
+        set(analysis.keys()) == {"goal_scores"}
+        and isinstance(analysis["goal_scores"], str)
+    ):
+        raw = analysis["goal_scores"].strip()
+
+        try:
+            decoded = json.loads(raw)
+        except json.JSONDecodeError:
+            decoded = None
+
+        if isinstance(decoded, dict):
+
+            # The VLM accidentally placed the whole
+            # scene analysis inside goal_scores.
+            if (
+                "goal_scores" in decoded
+                and "important_objects" in decoded
+                and "wall_candidates" in decoded
+            ):
+                print(
+                    "[SCENE NORMALIZE] "
+                    "unwrapped complete scene object "
+                    "from goal_scores string",
+                    flush=True,
+                )
+
+                analysis = decoded
+
+            # Another malformed form seen in your log:
+            #
+            # {
+            #   "goal_scores": {
+            #       "reach_object": ...,
+            #       ...
+            #       "important_objects": [...],
+            #       "wall_candidates": [...]
+            #   }
+            # }
+            #
+            # Here those top-level fields were placed
+            # inside the goal_scores object.
+            elif (
+                "important_objects" in decoded
+                and "wall_candidates" in decoded
+            ):
+                print(
+                    "[SCENE NORMALIZE] "
+                    "promoting misplaced scene fields",
+                    flush=True,
+                )
+
+                important_objects = decoded.pop(
+                    "important_objects"
+                )
+
+                wall_candidates = decoded.pop(
+                    "wall_candidates"
+                )
+
+                analysis = {
+                    "goal_scores": decoded,
+                    "important_objects": important_objects,
+                    "wall_candidates": wall_candidates,
+                }
+
+    required_top_level = {
+        "wall_candidates",
+        "ui_candidates",
+        "important_objects",
+        "goal_scores",
+    }
+
+    missing = required_top_level - set(analysis)
+
+    if missing:
+        raise ValueError(
+            f"scene analysis missing fields: {sorted(missing)}"
+        )
+
+    if not isinstance(analysis["wall_candidates"], list):
+        raise TypeError(
+            "wall_candidates must be a list"
+        )
+    if not isinstance(analysis["ui_candidates"],list,):
+        raise TypeError(
+            "ui_candidates must be a list"
+        )
+    if not isinstance(analysis["important_objects"], list):
+        raise TypeError(
+            "important_objects must be a list"
+        )
+
+    goal_scores = analysis["goal_scores"]
+
+    # Some local models return the nested object as
+    # a JSON-encoded string.
+    if isinstance(goal_scores, str):
+        try:
+            goal_scores = json.loads(goal_scores)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                "goal_scores was returned as an invalid JSON string"
+            ) from exc
+
+    # Some local models incorrectly wrap the object
+    # in a one-element array:
+    #
+    # "goal_scores": [{...}]
+    #
+    # Unwrap this safely.
+    if isinstance(goal_scores, list):
+        if (
+            len(goal_scores) == 1
+            and isinstance(goal_scores[0], dict)
+        ):
+            print(
+                "[SCENE NORMALIZE] unwrapping "
+                "goal_scores singleton list",
+                flush=True,
+            )
+            goal_scores = goal_scores[0]
+        else:
+            raise TypeError(
+                "goal_scores must be an object; "
+                f"received list with {len(goal_scores)} elements"
+            )
+
+    if not isinstance(goal_scores, dict):
+        raise TypeError(
+            "goal_scores must be dict, "
+            f"got {type(goal_scores).__name__}"
+        )
+
+    missing_goals = (
+        EXPECTED_GOAL_TYPES
+        - set(goal_scores)
+    )
+
+    if missing_goals:
+        raise ValueError(
+            "goal_scores missing goal types: "
+            f"{sorted(missing_goals)}"
+        )
+
+    for goal_type in EXPECTED_GOAL_TYPES:
+
+        result = goal_scores[goal_type]
+
+        if not isinstance(result, dict):
+            raise TypeError(
+                f"goal_scores[{goal_type!r}] "
+                "must be an object"
+            )
+
+        required_fields = {
+            "confidence",
+            "target_ids",
+            "evidence",
+        }
+
+        missing_fields = (
+            required_fields
+            - set(result)
+        )
+
+        if missing_fields:
+            raise ValueError(
+                f"{goal_type} missing fields: "
+                f"{sorted(missing_fields)}"
+            )
+
+        if not isinstance(
+            result["target_ids"],
+            list,
+        ):
+            raise TypeError(
+                f"{goal_type}.target_ids "
+                "must be a list"
+            )
+
+        if not isinstance(
+            result["confidence"],
+            (int, float),
+        ):
+            raise TypeError(
+                f"{goal_type}.confidence "
+                "must be numeric"
+            )
+
+        if not isinstance(
+            result["evidence"],
+            str,
+        ):
+            raise TypeError(
+                f"{goal_type}.evidence "
+                "must be a string"
+            )
+
+    # Work on a shallow copy rather than unexpectedly
+    # mutating the raw model result.
+    analysis = dict(analysis)
+    analysis["goal_scores"] = goal_scores
+
+    return analysis
 
 def validate_scene_analysis(
     analysis,
     controlled_ids,
     objects,
-    traversable_color_evidence,
-):
+    traversable_color_evidence,):
+
+    analysis = normalize_scene_analysis(analysis)
+
     controlled_ids = set(controlled_ids)
 
     strongly_traversable_colors = {
@@ -531,6 +839,13 @@ def validate_scene_analysis(
         obj.id: obj
         for obj in objects
     }
+
+    ui_ids = set(
+        analysis.get(
+            "ui_candidates",
+            [],
+        )
+    )
 
     # Controlled entity cannot be a wall.
     analysis["wall_candidates"] = [
@@ -552,19 +867,20 @@ def validate_scene_analysis(
         )
     ]
 
-    # Controlled entity should not be listed as
-    # an interesting/target object.
+    # Exclude controlled components and UI from important objects.
     analysis["important_objects"] = [
         obj_id
         for obj_id in analysis["important_objects"]
         if obj_id not in controlled_ids
+           and obj_id not in ui_ids
     ]
 
     # Remove controlled components from
     # every goal's target list.
-    for result in (
-        analysis["goal_scores"].values()
+    for goal_type, result in (
+        analysis["goal_scores"].items()
     ):
+
         original_targets = set(
             result["target_ids"]
         )
@@ -572,25 +888,28 @@ def validate_scene_analysis(
         cleaned_targets = (
             original_targets
             - controlled_ids
+            - ui_ids
         )
 
         result["target_ids"] = sorted(
             cleaned_targets
         )
 
-        # If the only proposed targets were the player,
-        # invalidate this hypothesis.
         if (
             original_targets
             and not cleaned_targets
         ):
             result["confidence"] = 0.0
 
+            result["evidence"] += (
+                " Targets were removed because "
+                "they were classified as UI."
+            )
+
     return analysis
 
 def build_composite_regions(
-    relationships,
-):
+    relationships,):
     contents = defaultdict(list)
 
     for relation in relationships:
@@ -609,8 +928,7 @@ def build_composite_regions(
 
 def get_controlled_pixels(
     objects,
-    controlled_ids,
-):
+    controlled_ids,):
     pixels = set()
 
     for obj in objects:
@@ -621,8 +939,7 @@ def get_controlled_pixels(
 
 def translate_pixels(
     pixels,
-    delta,
-):
+    delta,):
     dx, dy = delta
 
     return {
@@ -630,11 +947,44 @@ def translate_pixels(
         for y, x in pixels
     }
 
+def detect_ui_candidates(
+    frame,
+    objects,
+    controlled_ids,):
+    height, width = frame.shape
+
+    result = []
+
+    for obj in objects:
+
+        if obj.id in controlled_ids:
+            continue
+
+        y1, x1, y2, x2 = obj.bbox
+
+        touches_edge = (
+            y1 == 0
+            or x1 == 0
+            or y2 == height - 1
+            or x2 == width - 1
+        )
+
+        near_edge = (
+            y1 <= 2
+            or x1 <= 2
+            or y2 >= height - 3
+            or x2 >= width - 3
+        )
+
+        if touches_edge or near_edge:
+            result.append(obj.id)
+
+    return result
+
 def destination_colors(
     frame,
     controlled_pixels,
-    delta,
-):
+    delta,):
     future_pixels = translate_pixels(
         controlled_pixels,
         delta,
@@ -666,8 +1016,7 @@ def destination_colors(
 
 def select_primary_goal(
     scene_analysis,
-    min_confidence=0.5,
-):
+    min_confidence=0.25,):
     scores = scene_analysis["goal_scores"]
 
     unknown_confidence = (
@@ -715,8 +1064,7 @@ def select_primary_goal(
 
 def get_object_pixels(
     objects,
-    object_ids,
-):
+    object_ids,):
     ids = set(object_ids)
     pixels = set()
 
@@ -728,8 +1076,7 @@ def get_object_pixels(
 
 def pixel_distance(
     pixels_a,
-    pixels_b,
-):
+    pixels_b,):
     if not pixels_a or not pixels_b:
         return float("inf")
 
@@ -746,8 +1093,7 @@ def choose_goal_action(
     target_ids,
     action_vectors,
     scene_analysis,
-    traversable_color_evidence,
-):
+    traversable_color_evidence,):
     controlled_pixels = get_object_pixels(
         objects,
         controlled_ids,
@@ -863,6 +1209,26 @@ def choose_goal_action(
         key=lambda x: x[0],
     )
 
+    # logging candidates
+    for candidate in candidates:
+        (
+            candidate_score,
+            candidate_action,
+            candidate_progress,
+            candidate_distance,
+            candidate_unknown,
+        ) = candidate
+
+        print(
+            f"[GOAL CANDIDATE] "
+            f"{candidate_action.name}: "
+            f"score={candidate_score}, "
+            f"progress={candidate_progress}, "
+            f"distance={candidate_distance}, "
+            f"unknown={candidate_unknown}",
+            flush=True,
+        )
+        
     score, action, progress, distance, unknown = best
 
     print(
@@ -882,7 +1248,11 @@ def choose_exploration_action(
     action_vectors,
     scene_analysis,
     traversable_color_evidence,
-):
+    state_visit_counts=None,):
+
+    if state_visit_counts is None:
+        state_visit_counts = {}
+
     controlled_pixels = get_object_pixels(
         objects,
         controlled_ids,
@@ -941,11 +1311,22 @@ def choose_exploration_action(
             else:
                 unknown += 1
 
-        # Prefer safe movement, but give a small bonus
-        # for exploring something not yet understood.
+        future_state = frozenset(future_pixels)
+
+        visit_count = state_visit_counts.get(future_state,0,)
+
         score = (
             known_traversable
             + unknown * 0.25
+            - visit_count * 5.0
+        )
+
+        print(
+            "[EXPLORE CANDIDATE]",
+            action.name,
+            f"score={score}",
+            f"visited={visit_count}",
+            flush=True,
         )
 
         candidates.append(
@@ -966,14 +1347,205 @@ def choose_exploration_action(
 
     return action
 
+def choose_goal_action_bfs(
+    frame,
+    objects,
+    controlled_ids,
+    target_ids,
+    action_vectors,
+    traversable_color_evidence,
+    failed_moves,
+    max_depth=30,):
+    controlled_pixels = get_controlled_pixels(
+        objects,
+        controlled_ids,
+    )
+
+    target_pixels = get_object_pixels(
+        objects,
+        target_ids,
+    )
+
+    if (
+        not controlled_pixels
+        or not target_pixels
+    ):
+        return None
+
+    traversable_colors = {
+        color
+        for color, count
+        in traversable_color_evidence.items()
+        if count >= 2
+    }
+
+    start = frozenset(
+        controlled_pixels
+    )
+
+    height, width = frame.shape
+
+    def legal(pixels):
+        for y, x in pixels:
+
+            if not (
+                0 <= y < height
+                and 0 <= x < width
+            ):
+                return False
+
+            # Goal may be entered.
+            if (y, x) in target_pixels:
+                continue
+
+            # Current player's cells are
+            # logically vacated floor.
+            if (y, x) in controlled_pixels:
+                continue
+
+            if (
+                int(frame[y, x])
+                not in traversable_colors
+            ):
+                return False
+
+        return True
+
+    queue = deque([(start,None,0,)])
+
+    visited = {start}
+
+    while queue:
+
+        pixels, first_action, depth = (queue.popleft())
+
+        if pixels & target_pixels:
+            print(
+                "[BFS] path found, "
+                f"first={first_action}",
+                flush=True,
+            )
+
+            return first_action
+
+        if depth >= max_depth:
+            continue
+
+        for action, delta in (
+            action_vectors.items()
+        ):
+            failed_key = (
+                pixels,
+                action,
+            )
+
+            if failed_key in failed_moves:
+                print("[BFS] skipping known failed move:",action.name,flush=True,)
+                continue
+            
+            next_pixels = frozenset(translate_pixels(pixels,delta,))
+
+            if next_pixels in visited:
+                continue
+
+            if not legal(next_pixels):
+                continue
+
+            visited.add(next_pixels)
+
+            queue.append(
+                (
+                    next_pixels,
+                    (first_action if first_action is not None else action),
+                    depth + 1,
+                )
+            )
+
+    print(
+        "[BFS] no verified path",
+        flush=True,
+    )
+
+    return None
+
+def capture_goal_target_hashes(
+    scene_analysis,
+    objects,):
+    if not isinstance(scene_analysis, dict):
+        print(
+            "[TARGET HASH WARNING] "
+            "scene_analysis is not a dict:",
+            type(scene_analysis).__name__,
+            flush=True,
+        )
+        return {}
+
+    goal_scores = scene_analysis.get(
+        "goal_scores",
+        {}
+    )
+
+    if not isinstance(goal_scores, dict):
+        print(
+            "[TARGET HASH WARNING] "
+            "goal_scores is not a dict:",
+            type(goal_scores).__name__,
+            flush=True,
+        )
+        return {}
+
+    objects_by_id = {
+        obj.id: obj
+        for obj in objects
+    }
+
+    result = {}
+
+    for goal_type, goal in (
+        scene_analysis["goal_scores"].items()
+    ):
+        result[goal_type] = [
+            objects_by_id[obj_id].shape_hash
+            for obj_id in goal["target_ids"]
+            if obj_id in objects_by_id
+        ]
+
+    return result
+
+def resolve_goal_target_ids(
+    objects,
+    target_hashes,):
+    hashes = set(target_hashes)
+
+    return [
+        obj.id
+        for obj in objects
+        if obj.shape_hash in hashes
+    ]
+
+def controlled_anchor(
+    objects,
+    controlled_ids,):
+    pixels = get_controlled_pixels(
+        objects,
+        controlled_ids,
+    )
+
+    if not pixels:
+        return None
+
+    return (
+        min(y for y, x in pixels),
+        min(x for y, x in pixels),
+    )
+
 ARC_COLOR_CHARS = ("WwgGcBMPRbSYOrNp")
 def frame_crop_ascii(
     frame,
     min_row,
     min_col,
     max_row,
-    max_col,
-):
+    max_col,):
     frame = np.asarray(frame)
 
     min_row = max(
@@ -1021,6 +1593,13 @@ def frame_crop_ascii(
             min_col,
             max_col,
         ],
+        "legend": {
+            ARC_COLOR_CHARS[i]:
+                ARC_COLOR_NAMES[i]
+            for i in range(
+                len(ARC_COLOR_CHARS)
+            )
+        },
         "ascii": "\n".join(lines),
     }
 
@@ -1030,8 +1609,17 @@ def inspect_scene(
     objects,
     controlled_components,
     action_vectors,
-    traversable_color_evidence,
-):
+    traversable_color_evidence,):
+    # Do not mutate the original tool arguments.
+    args = dict(args)
+
+    if "object_ids" in args:
+        args["object_ids"] = (
+            normalize_object_ids(
+                args["object_ids"]
+            )
+        )
+
     query = args["query"]
 
     if query == "summary":
@@ -1065,32 +1653,20 @@ def inspect_scene(
             for obj in objects
             if obj.id in controlled_components
         ]
-
-    # if query == "component":
-    #     object_id = args["object_id"]
-
-    #     obj = next(
-    #         (obj for obj in objects if obj.id == object_id),
-    #         None,
-    #     )
-
-    #     if obj is None:
-    #         return {
-    #             "error": "unknown object id"
-    #         }
-
-    #     return {
-    #         "id": obj.id,
-    #         "color": ARC_COLOR_NAMES[
-    #             obj.color
-    #         ],
-    #         "pixels": len(obj.pixels),
-    #         "bbox": list(obj.bbox),
-    #         "center": list(obj.center),
-    #         "shape_hash": obj.shape_hash,
-    #     }
     if query == "component":
-        ids = set(args.get("object_ids",[],))
+        ids = args.get("object_ids")
+
+        if ids:
+            ids = set(ids)
+
+            selected_objects = [
+                obj
+                for obj in objects
+                if obj.id in ids
+            ]
+
+        else:
+            selected_objects = objects
 
         return [
             {
@@ -1105,8 +1681,7 @@ def inspect_scene(
                 "center": list(obj.center),
                 "shape_hash": obj.shape_hash,
             }
-            for obj in objects
-            if obj.id in ids
+            for obj in selected_objects
         ]
     if query == "repeated_shapes":
         return group_objects_by_hash(
@@ -1130,6 +1705,216 @@ def inspect_scene(
     return {
         "error": f"unknown query {query}"
     }
+
+def get_frontier_actions(
+    state,
+    action_vectors,
+    tested_actions,
+    blocked_actions,):
+    """
+    Return actions from this state that have never
+    been experimentally tested.
+    """
+
+    frontier_actions = []
+
+    for action in action_vectors:
+
+        if action in tested_actions.get(
+            state,
+            set(),
+        ):
+            continue
+
+        if (
+            state,
+            action,
+        ) in blocked_actions:
+            continue
+
+        frontier_actions.append(action)
+
+    return frontier_actions
+
+def plan_to_nearest_frontier(
+    start_state,
+    action_vectors,
+    transition_graph,
+    tested_actions,
+    blocked_actions,
+    previous_action=None,):
+    """
+    Search the learned transition graph for the
+    closest reachable state that still has an
+    untested action.
+
+    Returns a list of actions.
+    """
+
+    if not start_state:
+        return None
+
+    queue = deque([
+        (
+            start_state,
+            [],
+        )
+    ])
+
+    visited = {
+        start_state
+    }
+
+    while queue:
+
+        state, path = queue.popleft()
+
+        frontier_actions = (
+            get_frontier_actions(
+                state=state,
+                action_vectors=action_vectors,
+                tested_actions=tested_actions,
+                blocked_actions=blocked_actions,
+            )
+        )
+
+        # If this state has an unknown transition,
+        # travel here and then test one.
+        if frontier_actions:
+
+            # If we travelled through the learned graph
+            # to reach this frontier, the last action in
+            # the path is the action we just used.
+            #
+            # If this is the starting state, use the real
+            # previous action executed by the agent.
+            last_action = (
+                path[-1]
+                if path
+                else previous_action
+            )
+
+            reverse = inverse_action(
+                last_action,
+                action_vectors,
+            )
+
+            # Prefer testing a new direction rather than
+            # immediately reversing the last movement.
+            preferred = [
+                action
+                for action in frontier_actions
+                if action != reverse
+            ]
+
+            if preferred:
+                exploration_action = preferred[0]
+            else:
+                exploration_action = frontier_actions[0]
+
+            return (
+                path
+                + [exploration_action]
+            )
+
+        # Otherwise move through transitions
+        # we already know.
+        for action, next_state in (
+            transition_graph
+            .get(state, {})
+            .items()
+        ):
+
+            # Historical edges may use controls unavailable in this frame.
+            if action not in action_vectors:
+                continue
+
+            if next_state in visited:
+                continue
+
+            visited.add(next_state)
+
+            queue.append(
+                (
+                    next_state,
+                    path + [action],
+                )
+            )
+
+    return None
+
+def inverse_action(
+    action,
+    action_vectors,):
+    if action is None:
+        return None
+
+    delta = action_vectors.get(action)
+
+    if delta is None:
+        return None
+
+    dx, dy = delta
+
+    inverse_delta = (
+        -dx,
+        -dy,
+    )
+
+    for candidate, candidate_delta in (
+        action_vectors.items()
+    ):
+        if candidate_delta == inverse_delta:
+            return candidate
+
+    return None
+
+def choose_frontier_action(
+    objects,
+    controlled_ids,
+    action_vectors,
+    transition_graph,
+    tested_actions,
+    blocked_actions,
+    previous_action=None):
+    current_pixels = get_controlled_pixels(
+        objects,
+        controlled_ids,
+    )
+
+    if not current_pixels:
+        return None
+
+    current_state = frozenset(
+        current_pixels
+    )
+
+    plan = plan_to_nearest_frontier(
+        start_state=current_state,
+        action_vectors=action_vectors,
+        transition_graph=transition_graph,
+        tested_actions=tested_actions,
+        blocked_actions=blocked_actions,
+        previous_action=previous_action,
+    )
+
+    if not plan:
+        print(
+            "[FRONTIER] no reachable frontier",
+            flush=True,
+        )
+        return None
+
+    print(
+        "[FRONTIER PLAN]",
+        " -> ".join(
+            action.name
+            for action in plan
+        ),
+        flush=True,
+    )
+
+    return plan[0]
 
 # formatting response
 GOAL_RESULT = {
@@ -1164,6 +1949,10 @@ SCENE_SCHEMA = {
             "type": "array",
             "items": {"type": "integer"},
         },
+        "ui_candidates": {
+            "type": "array",
+            "items": {"type": "integer"},
+        },
         "important_objects": {
             "type": "array",
             "items": {"type": "integer"},
@@ -1190,9 +1979,47 @@ SCENE_SCHEMA = {
           ],
           "additionalProperties": False,
         },
+        "object_roles": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "object_id": {"type": "integer"},
+                    "role": {
+                        "type": "string",
+                        "enum": [
+                            "key",
+                            "door",
+                            "switch",
+                            "exit",
+                            "collectible",
+                            "hazard",
+                            "portal",
+                            "obstacle",
+                            "marker",
+                            "unknown"
+                        ]
+                    },
+                    "confidence": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1
+                    },
+                    "evidence": {"type": "string"}
+                },
+                "required": [
+                    "object_id",
+                    "role",
+                    "confidence",
+                    "evidence"
+                ],
+                "additionalProperties": False
+            }
+        }
     },
     "required": [
         "wall_candidates",
+        "ui_candidates",
         "important_objects",
         "goal_scores",
     ],
@@ -1253,20 +2080,43 @@ def analyze_scene_vlm(
     action_vectors,
     controlled_components,
     traversable_color_evidence,
-):
+    previous_feedback=None,
+    reanalysis_reason=None,):
     image_url = frame_to_data_url(frame)
-
+    controlled_description = [
+        {
+            "frame_id": obj.id,
+            "color": ARC_COLOR_NAMES[
+                obj.color
+            ],
+            "shape_hash": obj.shape_hash,
+            "bbox": list(obj.bbox),
+        }
+        for obj in objects
+        if obj.id
+        in controlled_components
+    ]
     verified_facts = {
-        "controlled_ids": sorted(
-            controlled_components
-        ),
+        "controlled_components": controlled_description,
         "action_vectors": {
             action.name: list(delta)
             for action, delta
             in action_vectors.items()
         },
-        "traversable_colors": dict(
-            traversable_color_evidence
+        "traversable_colors":  [
+            {
+                "color_id": color,
+                "color_name": (ARC_COLOR_NAMES[color]),
+                "observations": count,
+            }
+            for color, count
+            in traversable_color_evidence.items()
+        ],
+        "edge_ui_candidates":
+        detect_ui_candidates(
+            frame,
+            objects,
+            controlled_components,
         ),
     }
 
@@ -1279,6 +2129,14 @@ Verified experimental facts:
     verified_facts,
     indent=2,
 )}
+
+Component frame_id values are local to the current frame.
+They may change after actions.
+
+Do not use frame_id as persistent object identity.
+
+shape_hash is translation-invariant color+shape evidence
+and is more stable across frames.
 
 Connected components are low-level visual
 components, not necessarily semantic objects.
@@ -1294,7 +2152,62 @@ When you have a plausible world/goal model,
 stop inspecting and call
 submit_scene_analysis.
 
+Some connected components may be user-interface elements rather
+than gameplay objects.
+
+UI elements often have one or more of these properties:
+
+- Touch or closely follow the outer screen boundary.
+- Stay in a fixed screen position while the controlled entity moves.
+- Change size or appearance after actions without being interacted with.
+- Look like health, energy, lives, score, inventory, or progress indicators.
+- Are spatially separated from the main playable region.
+
+Identify likely UI components in ui_candidates.
+
+Do not include UI components as goal targets unless there is
+strong evidence that the game explicitly requires interacting
+with the interface itself.
+
+The level may require multiple sequential interactions.
+
+Do not assume the visible final-looking object is directly reachable.
+
+Consider whether objects have semantic roles such as:
+- key / collectible
+- switch / activator
+- locked door / barrier
+- portal
+- exit / destination
+- hazard
+
+A useful object may be a prerequisite rather than the final goal.
+
+When an object disappears after the controlled entity contacts it,
+treat this as evidence that it was collected or activated.
+
+Look for resulting changes elsewhere in the gameplay area and infer
+the next likely subgoal.
 You have a limited inspection budget.
+
+Previous experimental feedback:
+
+{json.dumps(previous_feedback or [], indent=2)}
+
+Reason analysis was requested again:
+
+{reanalysis_reason or "initial analysis"}
+
+If a previous goal/target hypothesis caused a loop,
+unexpected reset, repeated states, or made no useful
+progress, treat that as negative experimental evidence.
+
+Do not simply repeat a failed hypothesis unless the
+current frame provides new evidence supporting it.
+
+Consider alternative goal types and alternative target
+objects. Prefer hypotheses that can be tested with a
+small number of actions.
 """
 
     messages = [
@@ -1315,81 +2228,10 @@ You have a limited inspection budget.
         }
     ]
 
-    MAX_TOOL_STEPS = 12
-
-    for step in range(MAX_TOOL_STEPS):
-        print(
-            f"[VLM TOOL STEP {step + 1}]",
-            flush=True,
-        )
-        if step < MAX_TOOL_STEPS - 1:
-            tools = SCENE_TOOLS
-            tool_choice = "auto"
-        else:
-            tools = [SCENE_TOOLS[1]]
-            tool_choice = {"type": "function",
-                           "function": {"name": ("submit_scene_analysis")},}
-       
-        response = (
-            client.chat.completions.create(
-                model=LOCAL_MODEL,
-                messages=messages,
-                tools=tools,
-                tool_choice=tool_choice,
-                temperature=0,
-                max_tokens=2048,
-                extra_body={
-                    "chat_template_kwargs": {
-                        "enable_thinking": True,
-                    },
-                },
-            )
-        )
-
-        message = (
-            response
-            .choices[0]
-            .message
-        )
-
-        reasoning = (
-            getattr(message,"reasoning",None,)
-            or getattr(message,"reasoning_content",None,)
-            or ""
-        )
-
-        print(
-            "reasoning:",
-            reasoning[:2000],
-            flush=True,
-        )
-
-        tool_calls = (
-            message.tool_calls
-            or []
-        )
-
-        print(
-            "tool call count:",
-            len(tool_calls),
-            flush=True,
-        )
-
-        assistant_message = {"role": "assistant",}
-
-        if message.content:
-            assistant_message["content"] = (message.content)
-        if reasoning:
-            assistant_message["reasoning"] = (reasoning)
-        if tool_calls:
-            assistant_message["tool_calls"] = [
-                call.model_dump()
-                for call in tool_calls
-            ]
-
-        messages.append(assistant_message)
-
-        remaining = (MAX_TOOL_STEPS - step)
+    MAX_INSPECTION_STEPS = 6
+    MAX_TOTAL_STEPS = 13
+    for step in range(MAX_TOTAL_STEPS):
+        remaining = (MAX_TOTAL_STEPS - step)
         if remaining == 2:
             messages.append(
                 {
@@ -1404,40 +2246,199 @@ You have a limited inspection budget.
                 }
             )
 
-        for call in tool_calls:
-            name = (
-                call.function.name
+        print(
+            f"[VLM TOOL STEP {step + 1}]",
+            flush=True,
+        )
+        if step < MAX_INSPECTION_STEPS:
+            tools = SCENE_TOOLS
+            tool_choice = "auto"
+            enable_thinking = True
+        else:
+            tools = [SCENE_TOOLS[1]]
+            tool_choice = "auto"
+            enable_thinking = False
+            if step == MAX_INSPECTION_STEPS:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Inspection is finished. "
+                            "Call submit_scene_analysis now with your best "
+                            "complete analysis. Do not answer in plain text."
+                        ),
+                    }
+                )
+        response = (
+            client.chat.completions.create(
+                model=LOCAL_MODEL,
+                messages=messages,
+                tools=tools,
+                tool_choice=tool_choice,
+                temperature=0,
+                max_tokens=2048,
+                extra_body={
+                    "chat_template_kwargs": {
+                        "enable_thinking": enable_thinking,
+                    },
+                },
             )
+        )
 
-            args = json.loads(
-                call.function.arguments
-            )
+        message = (response.choices[0].message)
+
+        reasoning = (
+            getattr(message,"reasoning",None,)
+            or getattr(message,"reasoning_content",None,)
+            or ""
+        )
+
+        print("reasoning:",reasoning[:2000],flush=True,)
+
+        tool_calls = (message.tool_calls or [])
+
+        print("tool call count:",len(tool_calls),flush=True,)
+
+        assistant_message = {"role": "assistant",}
+
+        if message.content:
+            assistant_message["content"] = (message.content)
+        # if reasoning:
+        #     assistant_message["reasoning"] = (reasoning)
+        if tool_calls:
+            assistant_message["tool_calls"] = [
+                call.model_dump()
+                for call in tool_calls
+            ]
+
+        messages.append(assistant_message)
+
+        for call in tool_calls:
+            name = call.function.name
+
+            raw_args = call.function.arguments
 
             print(
-                f"[TOOL] {name}: {args}",
+                f"[RAW TOOL ARGS] "
+                f"name={name} "
+                f"id={call.id} "
+                f"args={raw_args!r}",
                 flush=True,
             )
 
+            try:
+                if isinstance(raw_args, dict):
+                    args = raw_args
+                else:
+                    raw_args = str(raw_args or "").strip()
+
+                    if not raw_args:
+                        raise json.JSONDecodeError(
+                            "empty tool arguments",
+                            raw_args,
+                            0,
+                        )
+
+                    args = json.loads(raw_args)
+
+            except json.JSONDecodeError as exc:
+                print(
+                    "[TOOL ARG JSON ERROR]",
+                    f"name={name}",
+                    f"error={exc}",
+                    f"raw={raw_args!r}",
+                    flush=True,
+                )
+
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.id,
+                        "content": json.dumps(
+                            {
+                                "error": (
+                                    "Your tool arguments were "
+                                    "not valid JSON. "
+                                    "Please call the tool again "
+                                    "with valid JSON arguments."
+                                )
+                            }
+                        ),
+                    }
+                )
+
+                continue
+
+            print(f"[TOOL] {name}: {args}",flush=True,)
+
+            
+            # -------------------------
+            # Final submission
+            # -------------------------
             if (name == "submit_scene_analysis"):
-                return (
-                    validate_scene_analysis(
-                        args,
-                        controlled_components,
-                        objects,
-                        traversable_color_evidence,
+                try:
+                    return (
+                        validate_scene_analysis(
+                            args,
+                            controlled_components,
+                            objects,
+                            traversable_color_evidence,
+                        )
                     )
-                )
+                except (KeyError,TypeError,ValueError,) as exc:
+                    print(
+                        "[BAD SCENE SUBMISSION]",
+                        repr(exc),
+                        flush=True,
+                    )
 
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": (
+                                call.id
+                            ),
+                            "content": json.dumps(
+                                {
+                                    "error": (
+                                        "Scene analysis arguments were invalid: "
+                                        f"{type(exc).__name__}: {exc}. "
+                                        "Retry submit_scene_analysis with "
+                                        "goal_scores, important_objects, and "
+                                        "wall_candidates as top-level arguments."
+                                    )
+                                }
+                            ),
+                        }
+                    )
+
+                    continue
+            # -------------------------
+            # Inspection
+            # -------------------------
             if name == "inspect_scene":
-                result = inspect_scene(
-                    args=args,
-                    frame=frame,
-                    objects=objects,
-                    controlled_components=(controlled_components),
-                    action_vectors=(action_vectors),
-                    traversable_color_evidence=(traversable_color_evidence),
+                try:
+                    result = inspect_scene(
+                        args=args,
+                        frame=frame,
+                        objects=objects,
+                        controlled_components=(controlled_components),
+                        action_vectors=(action_vectors),
+                        traversable_color_evidence=(traversable_color_evidence),
+                    )
+                except Exception as exc:
+                    result = {
+                        "error": (
+                            f"inspect_scene failed: "
+                            f"{type(exc).__name__}: "
+                            f"{exc}"
+                        )
+                    }
+                print(
+                    "[TOOL RESULT]",
+                    json.dumps(result)[:3000],
+                    flush=True,
                 )
-
                 messages.append(
                     {
                         "role": "tool",
@@ -1449,18 +2450,73 @@ You have a limited inspection budget.
                         ),
                     }
                 )
+                continue
 
-        if not tool_calls:
-            print(
-                "[VLM] no tool call; "
-                "asking model to continue",
-                flush=True,
+            # Unknown tool
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": json.dumps(
+                        {
+                            "error": (
+                                f"Unknown tool: {name}"
+                            )
+                        }
+                    ),
+                }
             )
-
-    raise RuntimeError(
-        "Qwen did not submit scene analysis "
-        "within tool-step budget."
+    print(
+        "[VLM ANALYSIS FAILED] "
+        "inspection budget exhausted without "
+        "a valid scene submission",
+        flush=True,
     )
+
+    return {
+        "wall_candidates": [],
+        "important_objects": [],
+        "goal_scores": {
+            "reach_object": {
+                "confidence": 0.0,
+                "target_ids": [],
+                "evidence": "analysis unavailable",
+            },
+            "match_pattern": {
+                "confidence": 0.0,
+                "target_ids": [],
+                "evidence": "analysis unavailable",
+            },
+            "collect_objects": {
+                "confidence": 0.0,
+                "target_ids": [],
+                "evidence": "analysis unavailable",
+            },
+            "activate_object": {
+                "confidence": 0.0,
+                "target_ids": [],
+                "evidence": "analysis unavailable",
+            },
+            "move_into_region": {
+                "confidence": 0.0,
+                "target_ids": [],
+                "evidence": "analysis unavailable",
+            },
+            "transform_shape": {
+                "confidence": 0.0,
+                "target_ids": [],
+                "evidence": "analysis unavailable",
+            },
+            "unknown": {
+                "confidence": 1.0,
+                "target_ids": [],
+                "evidence": (
+                    "VLM failed to produce a valid "
+                    "scene analysis"
+                ),
+            },
+        },
+    }
 
 class MyAgentCore:
     MAX_ACTIONS = 20
@@ -1479,6 +2535,32 @@ class MyAgentCore:
         self.previous_frame = None
         self.traversable_color_evidence = defaultdict(int)
         self.act_steps = 0
+        self.act_steps_since_analysis = 0
+        self.needs_reanalysis = False
+        self.controlled_shape_hashes = set()
+        self.goal_target_hashes = {}
+        self.failed_moves = set()
+        self.last_action_state = None
+        self.no_goal_steps = 0
+        # Recent controlled-player positions for loop detection.
+        self.recent_controlled_states = deque(maxlen=8)
+        # Persistent visit counts for exploration.
+        self.state_visit_counts = defaultdict(int)
+        # Why the next VLM analysis is being requested.
+        self.reanalysis_reason = None
+        # Feedback about failed hypotheses.
+        self.analysis_feedback = []
+        # Currently tested goal.
+        self.current_goal = None
+        self.current_goal_steps = 0
+        # Learned navigation graph.
+        self.transition_graph = defaultdict(dict)
+        # Actions that have actually been attempted
+        # from each controlled-player state.
+        self.tested_actions = defaultdict(set)
+        # State/action pairs that are known to be blocked.
+        self.blocked_actions = set()
+        
 
     def infer_controlled_entity(self):
         if len(self.action_components) < 4:
@@ -1502,8 +2584,7 @@ class MyAgentCore:
     def learn_traversable_colors(
         self,
         previous_frame,
-        transition,
-    ):
+        transition,):
         groups = group_movements(
             transition.moved_objects
         )
@@ -1552,8 +2633,7 @@ class MyAgentCore:
 
     def track_controlled_entity(
         self,
-        transition,
-    ):
+        transition,):
         if not self.controlled_component_ids:
             return
 
@@ -1579,6 +2659,98 @@ class MyAgentCore:
 
         if current_ids:
             self.controlled_component_ids = current_ids
+
+    def resolve_controlled_ids(
+        self,
+        objects,):
+        if not self.controlled_shape_hashes:
+            return
+
+        matches = [
+            obj
+            for obj in objects
+            if obj.shape_hash
+            in self.controlled_shape_hashes
+        ]
+
+        if len(matches) != len(
+            self.controlled_shape_hashes
+        ):
+            print(
+                "[CONTROLLED RESOLVE WARNING]",
+                "expected hashes:",
+                self.controlled_shape_hashes,
+                "matches:",
+                [
+                    (
+                        obj.id,
+                        obj.shape_hash,
+                    )
+                    for obj in matches
+                ],
+                flush=True,
+            )
+            return
+
+        self.controlled_component_ids = {
+            obj.id
+            for obj in matches
+        }
+
+        print(
+            "[CONTROLLED RESOLVED]",
+            [
+                {
+                    "id": obj.id,
+                    "color": (
+                        ARC_COLOR_NAMES[
+                            obj.color
+                        ]
+                    ),
+                    "hash": obj.shape_hash,
+                    "bbox": obj.bbox,
+                }
+                for obj in matches
+            ],
+            flush=True,
+        )
+
+    def clear_navigation_memory(
+        self,):
+        self.failed_moves.clear()
+        self.last_action_state = None
+
+        print(
+            "[NAV] failed-move memory cleared",
+            flush=True,
+        )
+
+    def request_reanalysis(
+        self,
+        reason,
+        reject_current_goal=False,):
+        print(
+            "[REANALYZE REQUEST]",
+            reason,
+            flush=True,
+        )
+
+        if reject_current_goal and self.current_goal is not None:
+            feedback = {
+                "goal": self.current_goal,
+                "reason": reason,
+            }
+
+            self.analysis_feedback.append(feedback)
+
+            print(
+                "[GOAL REJECTED]",
+                feedback,
+                flush=True,
+            )
+
+        self.reanalysis_reason = reason
+        self.needs_reanalysis = True
 
     def learn(self, action, transition):
         if action is None:
@@ -1610,6 +2782,8 @@ class MyAgentCore:
     def observe(self, frame):
         frame = np.asarray(frame)
 
+        previous_controlled_ids = set(self.controlled_component_ids)
+
         objects = extract_objects(frame)
 
         if (
@@ -1627,168 +2801,469 @@ class MyAgentCore:
                     self.previous_action,
                     transition,
                 )
-            if (self.mode == "ACT" and self.act_steps >= 1):
+            elif self.mode == "ACT":
+                # reanalysis if move was not expected
+                expected_delta = (
+                    self.action_vectors.get(
+                        self.previous_action
+                    )
+                )
+
+                controlled_movements = [
+                    movement
+                    for movement
+                    in transition.moved_objects
+                    if (movement.before.id in previous_controlled_ids and 
+                        movement.delta == expected_delta)
+                ]
+
+                expected_move_seen = bool(controlled_movements)
+
                 print(
-                    "\n=== POST-ACT TRANSITION ===",
+                    "[ACT RESULT]",
+                    f"action={self.previous_action.name}",
+                    f"expected={expected_delta}",
+                    f"success={expected_move_seen}",
                     flush=True,
                 )
-                print(
-                    "action:",
-                    self.previous_action.name,
-                    flush=True,
-                )
-                print(
-                    "movements:",
-                    [
-                        {
-                            "before": m.before.id,
-                            "after": m.after.id,
-                            "delta": m.delta,
-                        }
-                        for m in transition.moved_objects
-                    ],
-                    flush=True,
-                )
-            else:
-                self.track_controlled_entity(
-                    transition,
-                )
+                # The state from which the previous action was issued.
+                source_state = self.last_action_state
+
+                if source_state is not None:
+
+                    # We have now experimentally tested this action
+                    # from this state.
+                    self.tested_actions[source_state].add(
+                        self.previous_action
+                    )
+                    if expected_move_seen:
+
+                        # Build the resulting controlled-player state
+                        # from the movement result.
+                        destination_pixels = set()
+
+                        for movement in controlled_movements:
+                            destination_pixels |= (
+                                movement.after.pixels
+                            )
+
+                        destination_state = frozenset(
+                            destination_pixels
+                        )
+
+                        if destination_state:
+                            self.transition_graph[
+                                source_state
+                            ][self.previous_action] = (
+                                destination_state
+                            )
+
+                            print(
+                                "[TRANSITION LEARNED]",
+                                f"{self.previous_action.name}:",
+                                f"{len(source_state)}px",
+                                "->",
+                                f"{len(destination_state)}px",
+                                flush=True,
+                            )
+
+                    else:
+
+                        self.failed_moves.add(
+                            (
+                                source_state,
+                                self.previous_action,
+                            )
+                        )
+
+                        self.blocked_actions.add(
+                            (
+                                source_state,
+                                self.previous_action,
+                            )
+                        )
+
+                        print(
+                            "[BLOCKED TRANSITION]",
+                            self.previous_action.name,
+                            flush=True,
+                        )
 
             self.learn_traversable_colors(
                 self.previous_frame,
                 transition,
             )
 
-        self.previous_state = objects
+        if self.controlled_shape_hashes:
+            self.resolve_controlled_ids(objects)
 
-        # Important: keep a copy because this is
-        # the frame BEFORE the next action.
+        if self.mode == "ACT":
+
+            current_pixels = frozenset(
+                get_controlled_pixels(
+                    objects,
+                    self.controlled_component_ids,
+                )
+            )
+
+            if current_pixels:
+
+                self.state_visit_counts[
+                    current_pixels
+                ] += 1
+
+                # Detect A -> B -> A two-state oscillation.
+                if (
+                    len(self.recent_controlled_states) >= 2
+                    and current_pixels
+                    == self.recent_controlled_states[-2]
+                ):
+                    self.request_reanalysis(
+                        reason="two-state movement loop detected",
+                        reject_current_goal=(
+                            self.current_goal is not None
+                        ),
+                    )
+
+                # More general repeated-state detection.
+                elif (
+                    self.state_visit_counts[current_pixels]
+                    >= 4
+                ):
+                    self.request_reanalysis(
+                        reason="controlled state visited repeatedly",
+                        reject_current_goal=(
+                            self.current_goal is not None
+                        ),
+                    )
+
+                self.recent_controlled_states.append(
+                    current_pixels
+                )
+        self.previous_state = objects
         self.previous_frame = frame.copy()
 
         return objects
-    
-    def choose_action(
+
+    def commit_action(
         self,
+        action,
+        source,):
+        controlled_pixels = (
+            get_controlled_pixels(
+                self.previous_state,
+                self.controlled_component_ids,
+            )
+        )
+
+        self.last_action_state = (
+            frozenset(
+                controlled_pixels
+            )
+        )
+
+        print(
+            f"[ACT] source={source}, "
+            f"action={action.name}, "
+            f"state_pixels="
+            f"{len(self.last_action_state)}",
+            flush=True,
+        )
+
+        self.previous_action = action
+        self.act_steps_since_analysis += 1
+
+        return action
+
+    def choose_action(self,
         frame: np.ndarray,
-        available_actions: list[int],
-    ) -> arcengine.GameAction:
+        available_actions: list[int],) -> arcengine.GameAction:
+
+        legal_actions = [arcengine.GameAction(value) for value in available_actions]
+        if not legal_actions:
+            raise ValueError("No available actions to choose from")
+        fallback_action = next(
+            (action for action in legal_actions if action != arcengine.GameAction.RESET),
+            legal_actions[0],
+        )
 
         objects = self.observe(frame)
+        # Keep learned controls intact; availability can change between frames.
+        legal_action_vectors = {
+            action: delta
+            for action, delta in self.action_vectors.items()
+            if action in legal_actions
+        }
+        # Don't execute one hypothesis indefinitely.
+        if (
+            self.mode == "ACT"
+            and self.act_steps_since_analysis >= 6
+        ):
+            self.request_reanalysis(
+                reason=(
+                    "six actions executed since analysis "
+                    "without solving the level"
+                ),
+                reject_current_goal=(
+                    self.current_goal is not None
+                ),
+            )
 
-        # DISCOVER → ANALYZE
+        # Exploration without an actionable goal
+        # should also be temporary.
+        if (
+            self.mode == "ACT"
+            and self.no_goal_steps >= 3
+        ):
+            self.request_reanalysis(
+                reason=(
+                    "three exploration actions taken "
+                    "without an actionable goal"
+                ),
+                reject_current_goal=False,
+            )
+        # -------------------------
+        # DISCOVER -> ANALYZE
+        # -------------------------
         if (
             self.mode == "DISCOVER"
             and len(self.action_vectors) >= 4
-            and self.scene_analysis is None
         ):
-            print(
-                "[MODE] DISCOVER -> ANALYZE",
-                flush=True,
-            )
+            print("[MODE] DISCOVER -> ANALYZE",flush=True,)
+            self.controlled_shape_hashes = {
+                obj.shape_hash
+                for obj in objects if obj.id
+                in self.controlled_component_ids
+            }
 
             print(
-                "[MODE] action vectors:",
-                {
-                    a.name: v
-                    for a, v
-                    in self.action_vectors.items()
-                },
+                "[CONTROLLED SIGNATURES]",
+                self.controlled_shape_hashes,
                 flush=True,
             )
             self.mode = "ANALYZE"
-
+        # -------------------------
+        # ACT -> ANALYZE
+        # -------------------------
+        if (
+            self.mode == "ACT"
+            and self.needs_reanalysis
+        ):
+            print("[MODE] ACT -> ANALYZE",flush=True,)
+            self.mode = "ANALYZE"
+        # -------------------------
+        # ANALYZE
+        # -------------------------
+        if self.mode == "ANALYZE":
+            print(
+                "[ANALYSIS CONTEXT]",
+                "reason=",
+                self.reanalysis_reason,
+                "feedback=",
+                json.dumps(
+                    self.analysis_feedback[-5:],
+                    indent=2,
+                ),
+                flush=True,
+            )
             self.scene_analysis = analyze_scene_vlm(
                 frame=frame,
                 objects=objects,
                 action_vectors=self.action_vectors,
                 controlled_components=self.controlled_component_ids,
                 traversable_color_evidence=self.traversable_color_evidence,
+                previous_feedback=self.analysis_feedback[-5:],
+                reanalysis_reason=self.reanalysis_reason,
             )
+
+            self.goal_target_hashes = (capture_goal_target_hashes(self.scene_analysis,objects,))
+            print("[TARGET SIGNATURES]",self.goal_target_hashes,flush=True,)
 
             print("\n=== VLM SCENE ANALYSIS ===")
-            print(
-                json.dumps(
-                    self.scene_analysis,
-                    indent=2,
-                )
-            )
+            print(json.dumps(self.scene_analysis,indent=2,))
 
+            self.reanalysis_reason = None
+            self.recent_controlled_states.clear()
+            self.no_goal_steps = 0
+            self.needs_reanalysis = False
+            self.act_steps_since_analysis = 0
             self.mode = "ACT"
-            
+        # -------------------------
+        # ACT
+        # -------------------------
         if self.mode == "ACT":
 
-            goal = select_primary_goal(
-                self.scene_analysis
-            )
-            
+            goal = select_primary_goal(self.scene_analysis)
+          
+            if goal is None:
+                self.no_goal_steps += 1
+                self.current_goal = None
+                self.current_goal_steps = 0
+
+                print(
+                    "[ACT] no actionable goal, "
+                    f"exploration_step={self.no_goal_steps}",
+                    flush=True,
+                )
+
+            else:
+                self.no_goal_steps = 0
+
+                target_hashes = (self.goal_target_hashes.get(goal["type"],[],))
+
+                goal_identity = {
+                    "type": goal["type"],
+                    "target_hashes": sorted(
+                        set(target_hashes)
+                    ),
+                }
+
+                if goal_identity != self.current_goal:
+
+                    print(
+                        "[GOAL TEST START]",
+                        goal_identity,
+                        flush=True,
+                    )
+
+                    self.current_goal = goal_identity
+                    self.current_goal_steps = 0
+
+                else:
+                    self.current_goal_steps += 1
             print(
                 "[ACT] selected goal:",
                 goal,
                 flush=True,
             )
 
-            action = None
-            
-            if goal is not None:
-                if goal["type"] in {
-                    "reach_object",
-                    "move_into_region",
-                    "activate_object",
-                }:
-                    action = choose_goal_action(
+            SUPPORTED_GOALS = {
+                "reach_object",
+                "move_into_region",
+                "activate_object",
+                "collect_objects"
+            }
+
+            # -------------------------
+            # 1. Try goal-directed plan
+            # -------------------------
+            if goal is not None and goal["type"] in SUPPORTED_GOALS:
+                # resolve target ids
+                target_hashes = (self.goal_target_hashes.get(goal["type"],[],))
+
+                target_ids = (
+                    resolve_goal_target_ids(
+                        self.previous_state,
+                        target_hashes,
+                    )
+                )
+
+                print(
+                    "[TARGET RESOLVED]",
+                    f"type={goal['type']}",
+                    f"hashes={target_hashes}",
+                    f"current_ids={target_ids}",
+                    flush=True,
+                )
+                
+                if not target_ids:
+                    print(
+                        "[TARGET] target disappeared "
+                        "or cannot be resolved",
+                        flush=True,
+                    )
+
+                    self.needs_reanalysis = True
+
+                else:
+                    action = choose_goal_action_bfs(
                         frame=np.asarray(frame),
                         objects=self.previous_state,
                         controlled_ids=(self.controlled_component_ids),
-                        target_ids=goal["target_ids"],
-                        action_vectors=self.action_vectors,
-                        scene_analysis=self.scene_analysis,
+                        target_ids=target_ids,
+                        action_vectors=legal_action_vectors,
+                        failed_moves=(self.failed_moves),
                         traversable_color_evidence=(self.traversable_color_evidence),
                     )
                     
+                    if action is not None:
+                        return self.commit_action(action,"goal_planner",)
+                    
                     if action is None:
-                        action = choose_exploration_action(
-                            frame=np.asarray(frame),
+                        print(
+                            "[BFS] no verified route to current target; "
+                            "keeping current goal and exploring",
+                            flush=True,
+                        )
+                        action = choose_frontier_action(
                             objects=self.previous_state,
                             controlled_ids=(self.controlled_component_ids),
-                            action_vectors=self.action_vectors,
-                            scene_analysis=(self.scene_analysis),
-                            traversable_color_evidence=(self.traversable_color_evidence),
+                            action_vectors=legal_action_vectors,
+                            transition_graph=self.transition_graph,
+                            tested_actions=self.tested_actions,
+                            blocked_actions=self.blocked_actions,
+                            previous_action=self.previous_action
                         )
+                        if action is None:
+                            action = choose_exploration_action(
+                                frame=np.asarray(frame),
+                                objects=self.previous_state,
+                                controlled_ids=(self.controlled_component_ids),
+                                action_vectors=legal_action_vectors,
+                                scene_analysis=(self.scene_analysis),
+                                traversable_color_evidence=(self.traversable_color_evidence),
+                                state_visit_counts=self.state_visit_counts,
+                            )
 
                     if action is None:
-                        action = (arcengine.GameAction.ACTION1)
-                    
-                    print(
-                        "[ACT] executing:",
-                        action.name,
-                        flush=True,
-                    )
-                    self.previous_action = action
-                    self.act_steps += 1
-                    return action
+                        print("No action chosen, using available fallback action")
+                        action = fallback_action
+                    if action is not None:
+                        return self.commit_action(action,"exploration_after_bfs_failure",)
 
-            # No sufficiently confident goal.
-            # Fall back to local exploration instead of returning None.
-            action = choose_exploration_action(
-                frame=np.asarray(frame),
+            # --------------------------------
+            # 2. Goal understood but unsupported
+            # --------------------------------
+            if (goal is not None and goal["type"] not in SUPPORTED_GOALS):
+                print(
+                    "[ACT] goal understood but "
+                    "planner does not support it:",
+                    goal["type"],
+                    flush=True,
+                )
+
+            # -------------------------
+            # 3. Exploration fallback
+            # -------------------------
+            action = choose_frontier_action(
                 objects=self.previous_state,
-                controlled_ids=(
-                    self.controlled_component_ids
-                ),
-                action_vectors=self.action_vectors,
-                scene_analysis=self.scene_analysis,
-                traversable_color_evidence=(
-                    self.traversable_color_evidence
-                ),
+                controlled_ids=(self.controlled_component_ids),
+                action_vectors=legal_action_vectors,
+                transition_graph=self.transition_graph,
+                tested_actions=self.tested_actions,
+                blocked_actions=self.blocked_actions,
+                previous_action=self.previous_action,
             )
+            if action is None:
+                action = choose_exploration_action(
+                    frame=np.asarray(frame),
+                    objects=self.previous_state,
+                    controlled_ids=(self.controlled_component_ids),
+                    action_vectors=legal_action_vectors,
+                    scene_analysis=(self.scene_analysis),
+                    traversable_color_evidence=(self.traversable_color_evidence),
+                    state_visit_counts=self.state_visit_counts,
+                )
 
-            if action is not None:
-                self.previous_action = action
-                return action
+            if action is not None: 
+                return self.commit_action(action,"exploration",)
+            
+            # -------------------------
+            # 4. Absolute fallback
+            # -------------------------
+            print("[ACT] no justified action found", flush=True,)
 
-            # Absolute safety fallback:
-            self.previous_action = arcengine.GameAction.ACTION1
-            return arcengine.GameAction.ACTION1
+            return self.commit_action(fallback_action,"absolute_fallback",)
         
         if self.mode == "DISCOVER":
 
@@ -1807,7 +3282,8 @@ class MyAgentCore:
             ]
 
             if not actions:
-                return arcengine.GameAction.RESET
+                self.previous_action = fallback_action
+                return fallback_action
 
             action = actions[
                 self.action_index % len(actions)
