@@ -50,6 +50,7 @@ def load_solver():
         'match_objects', 'describe_transition', 'extract_objects', 'group_movements',
         'resolve_goal_target_ids', 'capture_goal_target_tracks', 'get_object_pixels',
         'get_controlled_pixels', 'pixel_distance', 'destination_colors',
+        'bbox_gap', 'expand_goal_target_region',
         'select_primary_goal', 'MyAgentSolver',
         'validate_scene_analysis',
         'choose_goal_action_bfs', 'choose_frontier_action', 'choose_exploration_action',
@@ -201,6 +202,51 @@ class TestPersistentTracking(unittest.TestCase):
         tracks = M['capture_goal_target_tracks'](scene, objects)['reach_object']
         self.assertEqual(tracks, [objects[0].track_id])
         self.assertEqual(M['resolve_goal_target_ids'](objects[:1], [o.track_id for o in objects]), [])
+
+    def test_target_region_expands_adjacent_marker_components_for_bfs(self):
+        frame = np.full((12, 8), 3, dtype=int)
+        # A 5x5 controlled object moves upward by five pixels. Its final
+        # footprint contacts the white marker and two light-gray pixels.
+        frame[6:11, 0:5] = 8
+        frame[2, 2] = 0
+        frame[2, 1] = 1
+        frame[3, 2] = 1
+        # A directly adjacent black obstacle must not join the target region.
+        frame[0, 3] = 5
+        objects = M['ObjectTracker']().update(M['extract_objects'](frame))
+        player = next(o for o in objects if o.color == 8)
+        target = next(o for o in objects if o.color == 0)
+        companions = [o for o in objects if o.color == 1]
+        obstacle = next(o for o in objects if o.color == 5)
+
+        without_region = M['choose_goal_action_bfs'](
+            frame, objects, [player.id], [target.id],
+            {Action.ACTION1: (0, -5)}, {3: 2}, set(),
+        )
+        region = M['expand_goal_target_region'](
+            objects, [target.id], [player.id], [], [obstacle.id], {3: 2},
+        )
+        with_region = M['choose_goal_action_bfs'](
+            frame, objects, [player.id], region,
+            {Action.ACTION1: (0, -5)}, {3: 2}, set(),
+        )
+
+        self.assertIsNone(without_region)
+        self.assertEqual(region, sorted([target.id, *(o.id for o in companions)]))
+        self.assertNotIn(obstacle.id, region)
+        self.assertEqual(with_region, Action.ACTION1)
+
+    def test_target_region_does_not_absorb_floor_or_large_neighbor(self):
+        target = obj({(3, 3)}, color=0, frame_id=1)
+        floor = obj({(3, 4)}, color=3, frame_id=2)
+        large = obj({(4, col) for col in range(20)}, color=1, frame_id=3)
+        target.track_id = 'target'
+        floor.track_id = 'floor'
+        large.track_id = 'large'
+        region = M['expand_goal_target_region'](
+            [target, floor, large], [target.id], [], [], [], {3: 2},
+        )
+        self.assertEqual(region, [target.id])
 
     def test_validation_rejects_ambiguous_target(self):
         objects = [obj({(0, 0)}, frame_id=5)]

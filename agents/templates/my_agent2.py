@@ -1661,6 +1661,72 @@ def resolve_goal_target_ids(
     # Never silently plan against only a subset of an unresolved target group.
     return [resolved[track] for track in sorted(tracks)] if tracks <= resolved.keys() else []
 
+
+def bbox_gap(a, b):
+    """Chebyshev gap between two inclusive bounding boxes."""
+    ay1, ax1, ay2, ax2 = a.bbox
+    by1, bx1, by2, bx2 = b.bbox
+    return max(
+        0,
+        ay1 - by2 - 1,
+        by1 - ay2 - 1,
+        ax1 - bx2 - 1,
+        bx1 - ax2 - 1,
+    )
+
+
+def expand_goal_target_region(
+    objects,
+    target_ids,
+    controlled_ids,
+    ui_ids,
+    wall_ids,
+    traversable_color_evidence,
+    max_gap=1,
+    max_component_pixels=16,
+    max_region_pixels=32,
+):
+    """Include small, adjoining marker components required for target contact.
+
+    The selected target remains the persistent identity anchor. Expansion only
+    affects collision legality for this frame, so nearby UI, known walls, the
+    player, and confirmed floor cannot be silently reclassified as a target.
+    """
+    by_id = {obj.id: obj for obj in objects}
+    region_ids = {obj_id for obj_id in target_ids if obj_id in by_id}
+    if not region_ids:
+        return []
+
+    traversable_colors = {
+        color for color, count in traversable_color_evidence.items()
+        if count >= 2
+    }
+    protected_ids = set(controlled_ids) | set(ui_ids) | set(wall_ids)
+
+    while True:
+        region_pixels = sum(len(by_id[obj_id].pixels) for obj_id in region_ids)
+        candidates = []
+        for candidate in objects:
+            if candidate.id in region_ids or candidate.id in protected_ids:
+                continue
+            if candidate.track_id is None or candidate.color in traversable_colors:
+                continue
+            if len(candidate.pixels) > max_component_pixels:
+                continue
+            if region_pixels + len(candidate.pixels) > max_region_pixels:
+                continue
+            if any(
+                bbox_gap(candidate, by_id[region_id]) <= max_gap
+                for region_id in region_ids
+            ):
+                candidates.append(candidate.id)
+
+        if not candidates:
+            break
+        region_ids.update(candidates)
+
+    return sorted(region_ids)
+
 def controlled_anchor(
     objects,
     controlled_ids,):
@@ -3500,11 +3566,27 @@ class MyAgentCore:
                     self.needs_reanalysis = True
 
                 else:
+                    target_region_ids = expand_goal_target_region(
+                        objects=self.previous_state,
+                        target_ids=target_ids,
+                        controlled_ids=self.controlled_component_ids,
+                        ui_ids=self.scene_analysis["ui_candidates"],
+                        wall_ids=self.scene_analysis["wall_candidates"],
+                        traversable_color_evidence=self.traversable_color_evidence,
+                    )
+
+                    print(
+                        "[TARGET REGION]",
+                        f"anchor_ids={target_ids}",
+                        f"contact_ids={target_region_ids}",
+                        flush=True,
+                    )
+
                     action = choose_goal_action_bfs(
                         frame=np.asarray(frame),
                         objects=self.previous_state,
                         controlled_ids=(self.controlled_component_ids),
-                        target_ids=target_ids,
+                        target_ids=target_region_ids,
                         action_vectors=legal_action_vectors,
                         failed_moves=(self.failed_moves),
                         traversable_color_evidence=(self.traversable_color_evidence),
