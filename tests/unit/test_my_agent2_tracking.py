@@ -757,6 +757,97 @@ class TestPersistentTracking(unittest.TestCase):
         self.assertNotIn(stable.track_id, by_track)
         self.assertNotIn(ui.track_id, by_track)
         self.assertEqual(core.post_interaction_candidates, observation['next_goal_candidates'])
+        self.assertEqual(observation['interaction_classification'], 'route_opened')
+        self.assertIsNone(core.repeat_activation_plan)
+
+    def test_repeatable_interaction_records_rotation_and_stops_on_state_cycle(self):
+        core = M['MyAgentCore']()
+        original = obj({(0, 0), (1, 0), (1, 1)}, color=6, frame_id=1)
+        rotated = obj({(0, 0), (0, 1), (1, 0)}, color=6, frame_id=1)
+        original.track_id = rotated.track_id = 'pattern'
+        initial_state, _ = core.interaction_state_signature([original], {'switch'})
+        pending = {
+            'goal_type': 'activate_object', 'target_tracks': ('switch',),
+            'target_region_pixels': frozenset({(5, 5)}),
+            'state_signature': initial_state,
+            'snapshots': {'pattern': core.snapshot_track(original)},
+        }
+        changed = [{'track_id': 'pattern', 'kind': 'changed', 'area': 'ui',
+                    'fields': ['shape_hash']}]
+        core.post_interaction_candidates = []
+        first = core.record_interaction_transition(
+            [rotated], pending, changed, {'pattern': rotated},
+        )
+        self.assertEqual(first['classification'], 'repeatable_pending')
+        self.assertEqual(
+            first['last_transition']['transforms'][0]['transform'], 'rotation_cw_90',
+        )
+        core.repeat_activation_plan['phase'] = 'reenter'
+        core.confirm_repeat_activation_state([rotated])
+        self.assertTrue(core.repeat_activation_plan['persistence_confirmed'])
+        self.assertEqual(first['classification'], 'repeatable')
+
+        rotated_state, _ = core.interaction_state_signature([rotated], {'switch'})
+        return_pending = dict(
+            pending,
+            state_signature=rotated_state,
+            snapshots={'pattern': core.snapshot_track(rotated)},
+        )
+        second = core.record_interaction_transition(
+            [original], return_pending, changed, {'pattern': original},
+        )
+        self.assertEqual(second['classification'], 'state_cycle')
+        self.assertIsNone(core.repeat_activation_plan)
+
+    def test_repeatable_activation_exits_then_reenters_target(self):
+        core = M['MyAgentCore']()
+        frame = np.full((12, 12), 3, dtype=int)
+        player = obj({(5, 5)}, color=1, frame_id=1)
+        target = obj({(5, 5)}, color=0, frame_id=2)
+        player.track_id, target.track_id = 'player', 'switch'
+        core.previous_state = [player, target]
+        core.controlled_track_ids = {'player'}
+        core.controlled_component_ids = {player.id}
+        core.traversable_color_evidence[3] = 2
+        actions = {Action.ACTION1: (0, -1), Action.ACTION2: (0, 1)}
+        core.action_vectors = actions
+        core.repeat_activation_plan = {
+            'target_tracks': ('switch',), 'target_region_pixels': frozenset(target.pixels),
+            'phase': 'exit', 'reentry_failures': 0,
+            'expected_state_signature': 'state', 'persistence_confirmed': False,
+        }
+        self.assertEqual(core.choose_repeat_activation_action(frame, actions), Action.ACTION1)
+        self.assertEqual(core.repeat_activation_plan['phase'], 'reenter')
+
+        player.pixels = {(4, 5)}
+        player.bbox = (4, 5, 4, 5)
+        player.center = (4.0, 5.0)
+        core.previous_state = [player, target]
+        self.assertEqual(core.choose_repeat_activation_action(frame, actions), Action.ACTION2)
+        self.assertEqual(core.current_goal['target_tracks'], ['switch'])
+        self.assertIsNotNone(core.pending_interaction)
+
+    def test_two_no_effect_contacts_stop_repeatable_hypothesis(self):
+        core = M['MyAgentCore']()
+        widget = obj({(1, 1)}, color=6, frame_id=1)
+        widget.track_id = 'widget'
+        state, _ = core.interaction_state_signature([widget], {'switch'})
+        pending = {
+            'goal_type': 'activate_object', 'target_tracks': ('switch',),
+            'target_region_pixels': frozenset({(5, 5)}),
+            'state_signature': state,
+            'snapshots': {'widget': core.snapshot_track(widget)},
+        }
+        core.post_interaction_candidates = []
+        first = core.record_interaction_transition(
+            [widget], pending, [], {'widget': widget},
+        )
+        second = core.record_interaction_transition(
+            [widget], pending, [], {'widget': widget},
+        )
+        self.assertEqual(first['no_effect_count'], 2)
+        self.assertEqual(second['classification'], 'stalled')
+        self.assertIsNone(core.repeat_activation_plan)
 
     def test_predicted_contact_survives_target_and_player_resegmentation(self):
         core = M['MyAgentCore']()
@@ -951,6 +1042,14 @@ class TestPersistentTracking(unittest.TestCase):
         core.post_interaction_candidates = [
             {'frame_id': 4, 'track_id': 'new-door', 'reasons': ['appeared']},
         ]
+        core.interaction_transitions = {
+            ('move_to_target', ('switch',)): {
+                'target_tracks': ('switch',), 'classification': 'repeatable',
+                'state_signatures': {'state-a', 'state-b'}, 'no_effect_count': 0,
+                'cycle_detected': False,
+                'last_transition': {'transforms': [{'transform': 'rotation_cw_90'}]},
+            },
+        }
         analysis = {
             'wall_candidates': [], 'ui_candidates': [], 'important_objects': [],
             'goal_scores': {'unknown': {'confidence': 1, 'target_ids': []}},
@@ -964,6 +1063,8 @@ class TestPersistentTracking(unittest.TestCase):
             'engine_state': 'playing', 'levels_completed': 2, 'run_state': 'playing',
         })
         self.assertEqual(captured['post_interaction_candidates'], core.post_interaction_candidates)
+        self.assertEqual(captured['interaction_transitions'][0]['classification'], 'repeatable')
+        self.assertEqual(captured['interaction_transitions'][0]['states_seen'], 2)
 
     def test_analysis_to_action_uses_track_targets(self):
         core = M['MyAgentCore']()

@@ -2349,7 +2349,8 @@ def analyze_scene_vlm(
     tracking_events=None,
     causal_observations=None,
     runtime_context=None,
-    post_interaction_candidates=None,):
+    post_interaction_candidates=None,
+    interaction_transitions=None,):
     image_url = frame_to_data_url(frame)
     controlled_description = [
         {
@@ -2371,6 +2372,7 @@ def analyze_scene_vlm(
     verified_facts = {
         "runtime_context": runtime_context or {},
         "post_interaction_candidates": post_interaction_candidates or [],
+        "interaction_transitions": interaction_transitions or [],
         "tracking_events": tracking_events or [],
         "causal_observations": causal_observations or [],
         "frame_shape": list(np.asarray(frame).shape),
@@ -2469,6 +2471,11 @@ post_interaction_candidates contains current non-UI gameplay components found
 from an observed change or a newly reachable route. They are hypotheses, not
 confirmed goals. Prefer them over unrelated components and use their current
 frame_id values exactly when submitting target_ids.
+
+interaction_transitions records persistent before/after state signatures for
+verified contacts. A repeatable interaction may be useful again only when it
+continues to produce a novel state; a cycle or repeated no-effect result means
+choose another hypothesis.
 
 The level may require multiple sequential interactions.
 
@@ -2897,6 +2904,8 @@ class MyAgentCore:
         self.scene_analysis = None
         self.runtime_context = {}
         self.post_interaction_candidates = []
+        self.interaction_transitions = {}
+        self.repeat_activation_plan = None
         self.scene_role_tracks = {}
         self.action_components = {}
         self.controlled_component_ids = set()
@@ -2962,6 +2971,70 @@ class MyAgentCore:
             "levels_completed": getattr(raw_state, "levels_completed", None),
             "run_state": getattr(game_run, "state", None),
         }
+
+    @staticmethod
+    def rotate_normalized_shape(pixels, turns):
+        """Rotate a normalized pixel shape clockwise by a quarter-turn count."""
+        rotated = set(pixels)
+        for _ in range(turns % 4):
+            height = max(y for y, _ in rotated) + 1
+            rotated = {(x, height - 1 - y) for y, x in rotated}
+            min_y = min(y for y, _ in rotated)
+            min_x = min(x for _, x in rotated)
+            rotated = {(y - min_y, x - min_x) for y, x in rotated}
+        return frozenset(rotated)
+
+    @classmethod
+    def describe_shape_change(cls, before, after):
+        """Use rotation labels when geometry proves one; otherwise stay generic."""
+        old = before.get("normalized_pixels")
+        new = after.get("normalized_pixels")
+        if not old or not new:
+            return None
+        old, new = frozenset(map(tuple, old)), frozenset(map(tuple, new))
+        if old == new:
+            return None
+        labels = {1: "rotation_cw_90", 2: "rotation_180", 3: "rotation_ccw_90"}
+        for turns, label in labels.items():
+            if cls.rotate_normalized_shape(old, turns) == new:
+                return label
+        return "shape_changed"
+
+    def interaction_state_signature(self, objects, excluded_tracks=()):
+        """Hash stable, small non-floor components into a reusable world state."""
+        excluded_tracks = set(excluded_tracks) | self.controlled_track_ids
+        traversable_colors = {
+            color for color, count in self.traversable_color_evidence.items()
+            if count >= 2
+        }
+        descriptors = [
+            (
+                obj.track_id, obj.color, obj.shape_hash, len(obj.pixels), obj.bbox,
+            )
+            for obj in objects
+            if (
+                obj.track_id is not None
+                and obj.track_id not in excluded_tracks
+                and obj.color not in traversable_colors
+                and len(obj.pixels) <= 256
+            )
+        ]
+        descriptors.sort(key=repr)
+        signature = hashlib.sha1(repr(descriptors).encode()).hexdigest()[:16]
+        return signature, descriptors
+
+    def cumulative_interaction_transitions(self):
+        return [
+            {
+                "target_tracks": list(record["target_tracks"]),
+                "classification": record["classification"],
+                "states_seen": len(record["state_signatures"]),
+                "no_effect_count": record["no_effect_count"],
+                "cycle_detected": record["cycle_detected"],
+                "last_transition": record.get("last_transition"),
+            }
+            for _, record in sorted(self.interaction_transitions.items())
+        ]
 
     def reachable_gameplay_tracks(self, frame, objects, excluded_tracks=()):
         """Find non-UI components reachable using only verified movement."""
@@ -3098,6 +3171,199 @@ class MyAgentCore:
                 item["pixel_count"], item["frame_id"],
             ),
         )[:12]
+
+    def record_interaction_transition(self, objects, pending, changes, after):
+        """Classify a contact from its observable state transition."""
+        target_tracks = tuple(sorted(set(pending["target_tracks"])))
+        key = (self.goal_interaction(pending["goal_type"]), target_tracks)
+        before_signature = pending["state_signature"]
+        after_signature, _ = self.interaction_state_signature(objects, target_tracks)
+        record = self.interaction_transitions.setdefault(key, {
+            "target_tracks": target_tracks,
+            "classification": "unknown",
+            "state_signatures": set(),
+            "no_effect_count": 0,
+            "cycle_detected": False,
+        })
+        record["state_signatures"].add(before_signature)
+        state_changed = before_signature != after_signature
+        rotation_labels = []
+        for change in changes:
+            if change["kind"] != "changed":
+                continue
+            before = pending["snapshots"].get(change["track_id"])
+            current = after.get(change["track_id"])
+            if before is None or current is None:
+                continue
+            label = self.describe_shape_change(before, self.snapshot_track(current))
+            if label is not None:
+                rotation_labels.append({
+                    "track_id": change["track_id"],
+                    "transform": label,
+                    "area": change["area"],
+                })
+        route_opened = any(
+            "became_reachable" in candidate["reasons"]
+            for candidate in self.post_interaction_candidates
+        )
+        prior_seen = after_signature in record["state_signatures"]
+        if state_changed:
+            record["state_signatures"].add(after_signature)
+            record["no_effect_count"] = 0
+        else:
+            record["no_effect_count"] += 1
+        cycle_detected = state_changed and prior_seen
+        record["cycle_detected"] |= cycle_detected
+        if state_changed and not cycle_detected and not route_opened:
+            record["classification"] = "repeatable_pending"
+            self.repeat_activation_plan = {
+                "target_tracks": target_tracks,
+                "target_region_pixels": pending["target_region_pixels"],
+                "phase": "exit",
+                "reentry_failures": 0,
+                "expected_state_signature": after_signature,
+                "persistence_confirmed": False,
+            }
+        elif cycle_detected or record["no_effect_count"] >= 2 or route_opened:
+            if (
+                self.repeat_activation_plan is not None
+                and tuple(self.repeat_activation_plan["target_tracks"]) == target_tracks
+            ):
+                self.repeat_activation_plan = None
+            record["classification"] = (
+                "state_cycle" if cycle_detected else
+                "stalled" if record["no_effect_count"] >= 2 else
+                "route_opened"
+            )
+        elif not state_changed and all(track not in after for track in target_tracks):
+            record["classification"] = "consumable_candidate"
+        record["last_transition"] = {
+            "before_state": before_signature,
+            "after_state": after_signature,
+            "state_changed": state_changed,
+            "target_not_visible": sorted(track for track in target_tracks if track not in after),
+            "transforms": rotation_labels,
+            "route_opened": route_opened,
+        }
+        return record
+
+    def confirm_repeat_activation_state(self, objects):
+        """Separate an interaction's persistent state change from one-frame animation."""
+        plan = self.repeat_activation_plan
+        if plan is None or plan["phase"] != "reenter":
+            return
+        signature, _ = self.interaction_state_signature(
+            objects, plan["target_tracks"],
+        )
+        key = ("move_to_target", tuple(plan["target_tracks"]))
+        record = self.interaction_transitions.get(key)
+        if signature == plan["expected_state_signature"]:
+            plan["persistence_confirmed"] = True
+            if record is not None:
+                record["classification"] = "repeatable"
+            return
+        self.repeat_activation_plan = None
+        if record is not None:
+            record["classification"] = "transient_effect"
+
+    def choose_repeat_activation_action(self, frame, action_vectors):
+        """Leave and re-enter a proven repeatable actuator while its state advances."""
+        plan = self.repeat_activation_plan
+        if plan is None:
+            return None
+        controlled_pixels = get_controlled_pixels(
+            self.previous_state, self.controlled_component_ids,
+        )
+        region_pixels = set(plan["target_region_pixels"])
+        if not controlled_pixels or not region_pixels:
+            self.repeat_activation_plan = None
+            return None
+
+        if plan["phase"] == "exit":
+            height, width = frame.shape
+            traversable_colors = {
+                color for color, count in self.traversable_color_evidence.items()
+                if count >= 2
+            }
+            source = frozenset(controlled_pixels)
+            options = []
+            for action, delta in action_vectors.items():
+                future = translate_pixels(controlled_pixels, delta)
+                entering = future - controlled_pixels
+                if future & region_pixels:
+                    continue
+                if any(not (0 <= y < height and 0 <= x < width) for y, x in future):
+                    continue
+                if any(
+                    int(frame[y, x]) not in traversable_colors
+                    for y, x in entering
+                ):
+                    continue
+                if (source, action) in self.failed_moves:
+                    continue
+                options.append((len(entering & region_pixels), action))
+            if not options:
+                self.repeat_activation_plan = None
+                self.request_reanalysis(
+                    "repeatable interaction cannot be exited with verified movement",
+                    reject_current_goal=False,
+                )
+                return None
+            _, action = min(options, key=lambda item: item[0])
+            plan["phase"] = "reenter"
+            print("[REPEAT ACTUATOR] exiting", action.name, flush=True)
+            return self.commit_action(action, "repeat_activation_exit")
+
+        target_ids = resolve_goal_target_ids(
+            self.previous_state, plan["target_tracks"],
+        )
+        if not target_ids:
+            plan["reentry_failures"] += 1
+            if plan["reentry_failures"] >= 3:
+                self.repeat_activation_plan = None
+                self.request_reanalysis(
+                    "repeatable interaction target did not reappear after exit",
+                    reject_current_goal=False,
+                )
+            return None
+        target_region_ids = expand_goal_target_region(
+            objects=self.previous_state,
+            target_ids=target_ids,
+            controlled_ids=self.controlled_component_ids,
+            ui_ids=(self.scene_analysis or {}).get("ui_candidates", []),
+            wall_ids=(self.scene_analysis or {}).get("wall_candidates", []),
+            traversable_color_evidence=self.traversable_color_evidence,
+        )
+        action = choose_goal_action_bfs(
+            frame=frame,
+            objects=self.previous_state,
+            controlled_ids=self.controlled_component_ids,
+            target_ids=target_region_ids,
+            action_vectors=action_vectors,
+            failed_moves=self.failed_moves,
+            traversable_color_evidence=self.traversable_color_evidence,
+        )
+        if action is None:
+            plan["reentry_failures"] += 1
+            if plan["reentry_failures"] >= 3:
+                self.repeat_activation_plan = None
+                self.request_reanalysis(
+                    "repeatable interaction became unreachable after exit",
+                    reject_current_goal=False,
+                )
+            return None
+        self.current_goal = {
+            "type": "activate_object",
+            "target_tracks": list(plan["target_tracks"]),
+        }
+        print("[REPEAT ACTUATOR] re-entering", action.name, flush=True)
+        return self.commit_action(
+            action,
+            "repeat_activation_reentry",
+            interaction_context=self.begin_interaction_observation(
+                target_region_ids, action, frame=frame,
+            ),
+        )
 
     def learn_traversable_colors(
         self,
@@ -3350,12 +3616,15 @@ class MyAgentCore:
 
     @staticmethod
     def snapshot_track(obj):
-        return {
+        snapshot = {
             "color": obj.color,
             "shape_hash": obj.shape_hash,
             "pixel_count": len(obj.pixels),
             "bbox": list(obj.bbox),
         }
+        if len(obj.pixels) <= 256:
+            snapshot["normalized_pixels"] = sorted(normalized_shape(obj))
+        return snapshot
 
     def begin_interaction_observation(self, target_region_ids, planned_action=None,
                                       frame=None):
@@ -3388,6 +3657,9 @@ class MyAgentCore:
         target_region_pixels = frozenset(
             get_object_pixels(self.previous_state, target_region_ids)
         )
+        state_signature, _ = self.interaction_state_signature(
+            self.previous_state, self.current_goal["target_tracks"],
+        )
         return {
             "goal_type": self.current_goal["type"],
             "target_tracks": tuple(self.current_goal["target_tracks"]),
@@ -3399,6 +3671,7 @@ class MyAgentCore:
             ),
             "ui_tracks": ui_tracks,
             "snapshots": snapshots,
+            "state_signature": state_signature,
             "reachable_tracks": (
                 self.reachable_gameplay_tracks(
                     frame, self.previous_state,
@@ -3543,6 +3816,11 @@ class MyAgentCore:
             objects, pending, changes, frame,
         )
         observation["next_goal_candidates"] = self.post_interaction_candidates
+        transition_record = self.record_interaction_transition(
+            objects, pending, changes, after,
+        )
+        observation["interaction_transition"] = transition_record["last_transition"]
+        observation["interaction_classification"] = transition_record["classification"]
         record = self.record_mechanics_observation(observation)
         print("[INTERACTION EFFECT]", json.dumps(observation), flush=True)
 
@@ -3737,6 +4015,8 @@ class MyAgentCore:
             }
         if self.controlled_track_ids:
             self.resolve_controlled_ids(objects)
+
+        self.confirm_repeat_activation_state(objects)
 
         interaction_observation = self.observe_pending_interaction(
             objects, movement_succeeded=expected_move_seen, frame=frame,
@@ -4043,6 +4323,7 @@ class MyAgentCore:
                 causal_observations=self.cumulative_mechanics_feedback(),
                 runtime_context=self.runtime_context,
                 post_interaction_candidates=self.post_interaction_candidates,
+                interaction_transitions=self.cumulative_interaction_transitions(),
             )
 
             self.goal_target_tracks = (capture_goal_target_tracks(self.scene_analysis,objects,))
@@ -4063,6 +4344,12 @@ class MyAgentCore:
         # ACT
         # -------------------------
         if self.mode == "ACT":
+
+            repeat_action = self.choose_repeat_activation_action(
+                np.asarray(frame), legal_action_vectors,
+            )
+            if repeat_action is not None:
+                return repeat_action
 
             goal = select_primary_goal(
                 self.scene_analysis,
