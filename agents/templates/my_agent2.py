@@ -1016,7 +1016,8 @@ def destination_colors(
 
 def select_primary_goal(
     scene_analysis,
-    min_confidence=0.25,):
+    min_confidence=0.25,
+    goal_penalties=None,):
     scores = scene_analysis["goal_scores"]
 
     unknown_confidence = (
@@ -1033,9 +1034,14 @@ def select_primary_goal(
         if not result["target_ids"]:
             continue
 
+        penalty = (goal_penalties or {}).get(goal_type, 0.0)
+        # None means this experiment is on hold until new evidence appears.
+        if penalty is None:
+            continue
+
         candidates.append(
             (
-                result["confidence"],
+                max(0.0, result["confidence"] - penalty),
                 goal_type,
                 result["target_ids"],
             )
@@ -2192,6 +2198,13 @@ You have a limited inspection budget.
 
 Previous experimental feedback:
 
+The records below aggregate all previous attempts by target and interaction.
+A stalled experiment is not proof that the puzzle goal is false.
+Inconclusive attempts did not establish success or failure. Entries marked
+retry_requires_new_evidence are withheld by the action selector until new
+navigation evidence or measurable progress appears. Changing the goal label
+does not make the same movement experiment new.
+
 {json.dumps(previous_feedback or [], indent=2)}
 
 Reason analysis was requested again:
@@ -2539,6 +2552,8 @@ class MyAgentCore:
         self.act_steps_since_analysis = 0
         self.actions_without_progress = 0
         self.best_goal_distances = {}
+        self.evidence_revision = 0
+        self.goal_experiments = {}
         self.needs_reanalysis = False
         self.controlled_shape_hashes = set()
         self.goal_target_hashes = {}
@@ -2551,8 +2566,6 @@ class MyAgentCore:
         self.state_visit_counts = defaultdict(int)
         # Why the next VLM analysis is being requested.
         self.reanalysis_reason = None
-        # Feedback about failed hypotheses.
-        self.analysis_feedback = []
         # Currently tested goal.
         self.current_goal = None
         self.current_goal_steps = 0
@@ -2738,13 +2751,14 @@ class MyAgentCore:
             flush=True,
         )
 
+        if self.current_goal is not None and not self.needs_reanalysis:
+            self.record_goal_outcome(reason, reject_current_goal)
+
         if reject_current_goal and self.current_goal is not None:
             feedback = {
                 "goal": self.current_goal,
                 "reason": reason,
             }
-
-            self.analysis_feedback.append(feedback)
 
             print(
                 "[GOAL REJECTED]",
@@ -2754,6 +2768,62 @@ class MyAgentCore:
 
         self.reanalysis_reason = reason
         self.needs_reanalysis = True
+
+    @staticmethod
+    def goal_interaction(goal_type):
+        # These labels currently execute the same movement/overlap planner.
+        # Renaming a hypothesis must not bypass an unsuccessful experiment.
+        if goal_type in {"reach_object", "move_into_region", "activate_object", "collect_objects"}:
+            return "move_to_target"
+        return goal_type
+
+    def record_goal_outcome(self, reason, stalled):
+        goal = self.current_goal
+        interaction = self.goal_interaction(goal["type"])
+        for target_hash in set(goal["target_hashes"]):
+            key = (interaction, target_hash)
+            record = self.goal_experiments.setdefault(key, {
+                "interaction": interaction,
+                "target_hash": target_hash,
+                "goal_types": [],
+                "stalled_count": 0,
+                "inconclusive_count": 0,
+                "last_stalled_revision": None,
+            })
+            if goal["type"] not in record["goal_types"]:
+                record["goal_types"].append(goal["type"])
+            record["stalled_count" if stalled else "inconclusive_count"] += 1
+            if stalled:
+                record["last_stalled_revision"] = self.evidence_revision
+            record["last_outcome"] = "stalled_experiment" if stalled else "inconclusive"
+            record["last_reason"] = reason
+
+    def goal_memory_penalties(self):
+        penalties = {}
+        for goal_type, hashes in self.goal_target_hashes.items():
+            records = [
+                self.goal_experiments[(self.goal_interaction(goal_type), target_hash)]
+                for target_hash in set(hashes)
+                if (self.goal_interaction(goal_type), target_hash) in self.goal_experiments
+            ]
+            if any(record["last_stalled_revision"] == self.evidence_revision for record in records):
+                penalties[goal_type] = None
+            elif records:
+                penalties[goal_type] = max(
+                    min(0.4, 0.1 * record["stalled_count"] + 0.05 * record["inconclusive_count"])
+                    for record in records
+                )
+        return penalties
+
+    def cumulative_goal_feedback(self):
+        # One entry per target/interaction, retaining counts rather than an
+        # unbounded event transcript or a sliding window that forgets failures.
+        return [
+            dict(record, retry_requires_new_evidence=(
+                record["last_stalled_revision"] == self.evidence_revision
+            ))
+            for _, record in sorted(self.goal_experiments.items())
+        ]
 
     def learn(self, action, transition):
         if action is None:
@@ -2987,6 +3057,7 @@ class MyAgentCore:
                 new_evidence = True
 
         if new_evidence:
+            self.evidence_revision += 1
             self.actions_without_progress = 0
         else:
             self.actions_without_progress += 1
@@ -3112,7 +3183,7 @@ class MyAgentCore:
                 self.reanalysis_reason,
                 "feedback=",
                 json.dumps(
-                    self.analysis_feedback[-5:],
+                    self.cumulative_goal_feedback(),
                     indent=2,
                 ),
                 flush=True,
@@ -3123,7 +3194,7 @@ class MyAgentCore:
                 action_vectors=self.action_vectors,
                 controlled_components=self.controlled_component_ids,
                 traversable_color_evidence=self.traversable_color_evidence,
-                previous_feedback=self.analysis_feedback[-5:],
+                previous_feedback=self.cumulative_goal_feedback(),
                 reanalysis_reason=self.reanalysis_reason,
             )
 
@@ -3145,7 +3216,10 @@ class MyAgentCore:
         # -------------------------
         if self.mode == "ACT":
 
-            goal = select_primary_goal(self.scene_analysis)
+            goal = select_primary_goal(
+                self.scene_analysis,
+                goal_penalties=self.goal_memory_penalties(),
+            )
           
             if goal is None:
                 self.no_goal_steps += 1
