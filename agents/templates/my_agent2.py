@@ -3001,23 +3001,26 @@ class MyAgentCore:
     def record_goal_outcome(self, reason, stalled):
         goal = self.current_goal
         interaction = self.goal_interaction(goal["type"])
-        for target_track in set(goal["target_tracks"]):
-            key = (interaction, target_track)
-            record = self.goal_experiments.setdefault(key, {
-                "interaction": interaction,
-                "target_track": target_track,
-                "goal_types": [],
-                "stalled_count": 0,
-                "inconclusive_count": 0,
-                "last_stalled_revision": None,
-            })
-            if goal["type"] not in record["goal_types"]:
-                record["goal_types"].append(goal["type"])
-            record["stalled_count" if stalled else "inconclusive_count"] += 1
-            if stalled:
-                record["last_stalled_revision"] = self.evidence_revision
-            record["last_outcome"] = "stalled_experiment" if stalled else "inconclusive"
-            record["last_reason"] = reason
+        # A target can be a multi-piece marker.  Its members describe one
+        # interaction, so remember the outcome for the group rather than
+        # turning one visit into a separate failure for every piece.
+        target_tracks = tuple(sorted(set(goal["target_tracks"]), key=repr))
+        key = (interaction, target_tracks)
+        record = self.goal_experiments.setdefault(key, {
+            "interaction": interaction,
+            "target_tracks": list(target_tracks),
+            "goal_types": [],
+            "stalled_count": 0,
+            "inconclusive_count": 0,
+            "last_stalled_revision": None,
+        })
+        if goal["type"] not in record["goal_types"]:
+            record["goal_types"].append(goal["type"])
+        record["stalled_count" if stalled else "inconclusive_count"] += 1
+        if stalled:
+            record["last_stalled_revision"] = self.evidence_revision
+        record["last_outcome"] = "stalled_experiment" if stalled else "inconclusive"
+        record["last_reason"] = reason
 
     def goal_memory_penalties(self):
         penalties = {}
@@ -3025,11 +3028,11 @@ class MyAgentCore:
             if not tracks or not resolve_goal_target_ids(self.previous_state or [], tracks):
                 penalties[goal_type] = None
                 continue
-            records = [
-                self.goal_experiments[(self.goal_interaction(goal_type), target_track)]
-                for target_track in set(tracks)
-                if (self.goal_interaction(goal_type), target_track) in self.goal_experiments
-            ]
+            key = (
+                self.goal_interaction(goal_type),
+                tuple(sorted(set(tracks), key=repr)),
+            )
+            records = [self.goal_experiments[key]] if key in self.goal_experiments else []
             if any(record["last_stalled_revision"] == self.evidence_revision for record in records):
                 penalties[goal_type] = None
             elif records:
@@ -3040,7 +3043,7 @@ class MyAgentCore:
         return penalties
 
     def cumulative_goal_feedback(self):
-        # One entry per target/interaction, retaining counts rather than an
+        # One entry per target group/interaction, retaining counts rather than an
         # unbounded event transcript or a sliding window that forgets failures.
         return [
             dict(record, retry_requires_new_evidence=(
@@ -3058,7 +3061,7 @@ class MyAgentCore:
             "bbox": list(obj.bbox),
         }
 
-    def begin_interaction_observation(self, target_region_ids):
+    def begin_interaction_observation(self, target_region_ids, planned_action=None):
         """Save the evidence needed to explain the result of one planned move."""
         if self.current_goal is None or self.previous_state is None:
             return None
@@ -3077,11 +3080,25 @@ class MyAgentCore:
                 and obj.track_id not in self.controlled_track_ids
             )
         }
+        source_controlled_pixels = frozenset(get_controlled_pixels(
+            self.previous_state, self.controlled_component_ids
+        ))
+        planned_action = planned_action or self.previous_action
+        planned_delta = self.action_vectors.get(planned_action)
+        predicted_destination_pixels = frozenset(
+            translate_pixels(source_controlled_pixels, planned_delta)
+        ) if source_controlled_pixels and planned_delta is not None else frozenset()
+        target_region_pixels = frozenset(
+            get_object_pixels(self.previous_state, target_region_ids)
+        )
         return {
             "goal_type": self.current_goal["type"],
             "target_tracks": tuple(self.current_goal["target_tracks"]),
-            "target_region_pixels": frozenset(
-                get_object_pixels(self.previous_state, target_region_ids)
+            "target_region_pixels": target_region_pixels,
+            "planned_action": planned_action,
+            "predicted_destination_pixels": predicted_destination_pixels,
+            "predicted_contact": bool(
+                predicted_destination_pixels & target_region_pixels
             ),
             "ui_tracks": ui_tracks,
             "snapshots": snapshots,
@@ -3133,7 +3150,7 @@ class MyAgentCore:
             )
         ]
 
-    def observe_pending_interaction(self, objects):
+    def observe_pending_interaction(self, objects, movement_succeeded=False):
         pending = self.pending_interaction
         self.pending_interaction = None
         if pending is None:
@@ -3142,10 +3159,16 @@ class MyAgentCore:
         controlled_pixels = get_controlled_pixels(
             objects, self.controlled_component_ids
         )
-        if not (
-            controlled_pixels
-            and controlled_pixels & pending["target_region_pixels"]
-        ):
+        actual_contact = bool(
+            controlled_pixels & pending["target_region_pixels"]
+        )
+        # Final contact can consume, recolor, or merge the target before the
+        # tracker can resolve its old IDs.  A verified movement into the
+        # precomputed destination is therefore contact evidence as well.
+        predicted_contact = bool(
+            movement_succeeded and pending.get("predicted_contact")
+        )
+        if not actual_contact and not predicted_contact:
             return None
 
         after = {
@@ -3203,8 +3226,9 @@ class MyAgentCore:
         observation = {
             "goal_type": pending["goal_type"],
             "target_tracks": list(pending["target_tracks"]),
-            "action": self.previous_action.name,
+            "action": (pending.get("planned_action") or self.previous_action).name,
             "contacted": True,
+            "contact_method": "actual" if actual_contact else "predicted",
             "target_not_visible": target_not_visible,
             "ui_changes": [change for change in changes if change["area"] == "ui"],
             "gameplay_changes": [
@@ -3264,6 +3288,7 @@ class MyAgentCore:
         frame = np.asarray(frame)
         new_evidence = False
         observed_action = False
+        expected_move_seen = False
 
         previous_controlled_ids = set(self.controlled_component_ids)
 
@@ -3405,12 +3430,18 @@ class MyAgentCore:
         if self.controlled_track_ids:
             self.resolve_controlled_ids(objects)
 
-        interaction_observation = self.observe_pending_interaction(objects)
+        interaction_observation = self.observe_pending_interaction(
+            objects, movement_succeeded=expected_move_seen
+        )
         if interaction_observation is not None:
             new_evidence = True
 
         if (self.mode == "ACT" and self.current_goal is not None
                 and not self.needs_reanalysis
+                and not (
+                    interaction_observation
+                    and interaction_observation["contacted"]
+                )
                 and not resolve_goal_target_ids(objects, self.current_goal["target_tracks"])):
             self.request_reanalysis(
                 "target identity unresolved or split/merged; collection is not established",
@@ -3820,7 +3851,7 @@ class MyAgentCore:
                             "goal_planner",
                             interaction_context=(
                                 self.begin_interaction_observation(
-                                    target_region_ids
+                                    target_region_ids, action
                                 )
                             ),
                         )

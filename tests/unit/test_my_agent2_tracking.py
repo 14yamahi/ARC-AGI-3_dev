@@ -284,6 +284,24 @@ class TestPersistentTracking(unittest.TestCase):
         core.previous_state = after
         self.assertIsNone(core.goal_memory_penalties()['reach_object'])
 
+    def test_composite_goal_outcome_is_recorded_once(self):
+        core = M['MyAgentCore']()
+        objects = core.tracker.update([
+            obj({(0, 0)}), obj({(0, 2)}, frame_id=1), obj({(0, 4)}, frame_id=2),
+        ])
+        tracks = [item.track_id for item in objects]
+        core.previous_state = objects
+        core.goal_target_tracks = {'reach_object': tracks}
+        core.current_goal = {'type': 'reach_object', 'target_tracks': tracks}
+
+        core.record_goal_outcome('target unresolved', False)
+
+        self.assertEqual(len(core.goal_experiments), 1)
+        record = next(iter(core.goal_experiments.values()))
+        self.assertEqual(set(record['target_tracks']), set(tracks))
+        self.assertEqual(record['inconclusive_count'], 1)
+        self.assertEqual(core.goal_memory_penalties()['reach_object'], .05)
+
     def test_episode_namespaces_and_fresh_memory(self):
         a, b = M['MyAgentCore'](1), M['MyAgentCore'](2)
         x = a.tracker.update([obj({(0, 0)})])[0]
@@ -381,6 +399,63 @@ class TestPersistentTracking(unittest.TestCase):
         self.assertIn('target contact produced', core.reanalysis_reason)
         self.assertFalse(core.goal_experiments)
         self.assertIsNone(core.pending_interaction)
+
+    def test_predicted_contact_survives_target_and_player_resegmentation(self):
+        core = M['MyAgentCore']()
+        player = obj({(5, 1), (5, 2)}, color=8, frame_id=1)
+        target = obj({(4, 1)}, color=0, frame_id=2)
+        before = core.tracker.update([player, target])
+        player, target = before
+        core.previous_state = before
+        core.controlled_track_ids = {player.track_id}
+        core.resolve_controlled_ids(before)
+        core.current_goal = {
+            'type': 'reach_object', 'target_tracks': [target.track_id],
+        }
+        core.scene_analysis = {'ui_candidates': []}
+        core.action_vectors = {Action.ACTION1: (0, -1)}
+        core.previous_action = Action.ACTION1
+        core.pending_interaction = core.begin_interaction_observation(
+            [target.id], Action.ACTION1,
+        )
+
+        # A consumed marker can cause the tracker to lose both the target and
+        # the old controlled component in the contact frame.
+        after = core.tracker.update([], core.controlled_track_ids, (0, -1))
+        core.controlled_component_ids = set()
+        observation = core.observe_pending_interaction(
+            after, movement_succeeded=True,
+        )
+
+        self.assertTrue(observation['contacted'])
+        self.assertEqual(observation['contact_method'], 'predicted')
+        self.assertEqual(observation['target_not_visible'], [target.track_id])
+        self.assertTrue(core.needs_reanalysis)
+
+    def test_blocked_planned_contact_does_not_create_causal_evidence(self):
+        core = M['MyAgentCore']()
+        player = obj({(5, 1), (5, 2)}, color=8, frame_id=1)
+        target = obj({(4, 1)}, color=0, frame_id=2)
+        before = core.tracker.update([player, target])
+        player, target = before
+        core.previous_state = before
+        core.controlled_track_ids = {player.track_id}
+        core.resolve_controlled_ids(before)
+        core.current_goal = {
+            'type': 'reach_object', 'target_tracks': [target.track_id],
+        }
+        core.scene_analysis = {'ui_candidates': []}
+        core.action_vectors = {Action.ACTION1: (0, -1)}
+        core.previous_action = Action.ACTION1
+        core.pending_interaction = core.begin_interaction_observation(
+            [target.id], Action.ACTION1,
+        )
+
+        self.assertIsNone(core.observe_pending_interaction(
+            before, movement_succeeded=False,
+        ))
+        self.assertFalse(core.mechanics_evidence)
+        self.assertFalse(core.needs_reanalysis)
 
     def test_ui_change_without_target_contact_is_not_associated(self):
         core = M['MyAgentCore']()
