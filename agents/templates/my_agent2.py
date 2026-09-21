@@ -3274,9 +3274,13 @@ class MyAgentCore:
 
     def choose_action(self,
         frame: np.ndarray,
-        available_actions: list[int],) -> arcengine.GameAction:
+        available_actions: list[int | arcengine.GameAction],) -> arcengine.GameAction:
 
-        legal_actions = [arcengine.GameAction(value) for value in available_actions]
+        legal_actions = [
+            value if isinstance(value, arcengine.GameAction)
+            else arcengine.GameAction.from_id(value)
+            for value in available_actions
+        ]
         if not legal_actions:
             raise ValueError("No available actions to choose from")
         fallback_action = next(
@@ -3598,7 +3602,7 @@ class MyAgentCore:
             actions = [
                 action
                 for action in actions
-                if action.value in available_actions
+                if action in legal_actions
             ]
 
             if not actions:

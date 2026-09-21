@@ -8,7 +8,7 @@ import asyncio
 import contextlib
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from enum import IntEnum
+from enum import Enum
 import hashlib
 import json
 from pathlib import Path
@@ -20,12 +20,25 @@ from unittest.mock import patch
 import numpy as np
 
 
-class Action(IntEnum):
-    RESET = 0
-    ACTION1 = 1
-    ACTION2 = 2
-    ACTION3 = 3
-    ACTION4 = 4
+class Action(Enum):
+    # Match ARCEngine: tuple construction with _value_ set during __init__.
+    # An IntEnum would incorrectly allow Action(0), masking the Kaggle failure.
+    RESET = (0, object)
+    ACTION1 = (1, object)
+    ACTION2 = (2, object)
+    ACTION3 = (3, object)
+    ACTION4 = (4, object)
+
+    def __init__(self, action_id, action_type):
+        self._value_ = action_id
+        self.action_type = action_type
+
+    @classmethod
+    def from_id(cls, action_id):
+        for action in cls:
+            if action.value == action_id:
+                return action
+        raise ValueError(f'No GameAction with id {action_id}')
 
 
 def load_solver():
@@ -67,6 +80,27 @@ def obj(pixels, color=1, frame_id=0):
 
 
 class TestPersistentTracking(unittest.TestCase):
+    def test_numeric_action_ids_use_engine_lookup(self):
+        with self.assertRaises(ValueError):
+            Action(0)
+        core = M['MyAgentCore']()
+        frame = np.zeros((4, 4), dtype=int)
+        self.assertEqual(core.choose_action(frame, [0, 1, 2, 3, 4]), Action.ACTION1)
+
+    def test_reset_only_availability(self):
+        core = M['MyAgentCore']()
+        self.assertEqual(core.choose_action(np.zeros((4, 4), dtype=int), [0]), Action.RESET)
+
+    def test_enum_and_mixed_availability(self):
+        for available in ([Action.ACTION3], [0, Action.ACTION3]):
+            core = M['MyAgentCore']()
+            self.assertEqual(core.choose_action(np.zeros((4, 4), dtype=int), available), Action.ACTION3)
+
+    def test_invalid_and_empty_availability_fail_explicitly(self):
+        for available in ([99], []):
+            with self.assertRaises(ValueError):
+                M['MyAgentCore']().choose_action(np.zeros((4, 4), dtype=int), available)
+
     def test_global_assignment_and_unmatched(self):
         self.assertEqual(set(M['maximum_assignment']([[.9, .8], [.85, .1]])), {(0, 1), (1, 0)})
         self.assertEqual(M['maximum_assignment']([[-1], [-1]]), [])
