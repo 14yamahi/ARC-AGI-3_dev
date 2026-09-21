@@ -347,6 +347,90 @@ class TestPersistentTracking(unittest.TestCase):
         core.observe(frame)
         self.assertIn((source, Action.ACTION1), core.blocked_actions)
 
+    def test_target_contact_records_ui_effect_and_requests_reanalysis(self):
+        core = M['MyAgentCore']()
+        player = obj({(5, 1), (5, 2)}, color=8, frame_id=1)
+        target = obj({(4, 1)}, color=0, frame_id=2)
+        ui = obj({(0, 6)}, color=11, frame_id=3)
+        before = core.tracker.update([player, target, ui])
+        player, target, ui = before
+        core.previous_state = before
+        core.controlled_track_ids = {player.track_id}
+        core.resolve_controlled_ids(before)
+        core.current_goal = {
+            'type': 'reach_object', 'target_tracks': [target.track_id],
+        }
+        core.scene_analysis = {'ui_candidates': [ui.id]}
+        core.pending_interaction = core.begin_interaction_observation([target.id])
+        core.previous_action = Action.ACTION1
+
+        after = core.tracker.update(
+            [obj({(4, 1), (4, 2)}, color=8, frame_id=7),
+             obj({(0, 6)}, color=12, frame_id=8)],
+            core.controlled_track_ids,
+            (0, -1),
+        )
+        core.resolve_controlled_ids(after)
+        observation = core.observe_pending_interaction(after)
+
+        self.assertTrue(observation['contacted'])
+        self.assertEqual(observation['target_not_visible'], [target.track_id])
+        self.assertEqual(observation['ui_changes'][0]['track_id'], ui.track_id)
+        self.assertEqual(observation['association_confidence'], 'strong_single_observation')
+        self.assertTrue(core.needs_reanalysis)
+        self.assertIn('target contact produced', core.reanalysis_reason)
+        self.assertFalse(core.goal_experiments)
+        self.assertIsNone(core.pending_interaction)
+
+    def test_ui_change_without_target_contact_is_not_associated(self):
+        core = M['MyAgentCore']()
+        player = obj({(5, 1), (5, 2)}, color=8, frame_id=1)
+        target = obj({(4, 1)}, color=0, frame_id=2)
+        ui = obj({(0, 6)}, color=11, frame_id=3)
+        before = core.tracker.update([player, target, ui])
+        player, target, ui = before
+        core.previous_state = before
+        core.controlled_track_ids = {player.track_id}
+        core.resolve_controlled_ids(before)
+        core.current_goal = {
+            'type': 'reach_object', 'target_tracks': [target.track_id],
+        }
+        core.scene_analysis = {'ui_candidates': [ui.id]}
+        core.pending_interaction = core.begin_interaction_observation([target.id])
+        core.previous_action = Action.ACTION3
+
+        after = core.tracker.update(
+            [obj({(5, 0), (5, 1)}, color=8, frame_id=7),
+             obj({(4, 1)}, color=0, frame_id=2),
+             obj({(0, 6)}, color=12, frame_id=8)],
+            core.controlled_track_ids,
+            (-1, 0),
+        )
+        core.resolve_controlled_ids(after)
+        self.assertIsNone(core.observe_pending_interaction(after))
+        self.assertFalse(core.mechanics_evidence)
+        self.assertFalse(core.needs_reanalysis)
+
+    def test_repeated_effect_strengthens_mechanics_evidence(self):
+        core = M['MyAgentCore']()
+        observation = {
+            'goal_type': 'activate_object', 'target_tracks': ['switch'],
+            'target_not_visible': [],
+            'ui_changes': [{'track_id': 'indicator', 'kind': 'changed', 'area': 'ui'}],
+            'gameplay_changes': [],
+        }
+        self.assertEqual(
+            core.record_mechanics_observation(dict(observation))['association_confidence'],
+            'observed_once',
+        )
+        self.assertEqual(
+            core.record_mechanics_observation(dict(observation))['association_confidence'],
+            'repeated',
+        )
+        feedback = core.cumulative_mechanics_feedback()
+        self.assertEqual(feedback[0]['contact_count'], 2)
+        self.assertEqual(feedback[0]['association_confidence'], 'repeated')
+
     def test_runner_reinitializes_on_reset_and_level_change(self):
         states = [
             SimpleNamespace(raw=SimpleNamespace(state=state, levels_completed=level),
@@ -399,10 +483,21 @@ class TestPersistentTracking(unittest.TestCase):
         analysis = {'wall_candidates': [], 'ui_candidates': [], 'important_objects': [target.id],
                     'goal_scores': {'unknown': {'confidence': 0, 'target_ids': []},
                                     'reach_object': {'confidence': .9, 'target_ids': [target.id]}}}
-        with patch.dict(M, analyze_scene_vlm=lambda **kw: analysis):
+        captured = {}
+        def analyze_scene_vlm(**kwargs):
+            captured.update(kwargs)
+            return analysis
+        core.record_mechanics_observation({
+            'goal_type': 'activate_object', 'target_tracks': ['prior_switch'],
+            'target_not_visible': [],
+            'ui_changes': [{'track_id': 'indicator', 'kind': 'changed', 'area': 'ui'}],
+            'gameplay_changes': [],
+        })
+        with patch.dict(M, analyze_scene_vlm=analyze_scene_vlm):
             action = core.choose_action(frame, [1, 2, 3, 4])
         self.assertEqual(action, Action.ACTION4)
         self.assertEqual(core.current_goal['target_tracks'], [target.track_id])
+        self.assertEqual(captured['causal_observations'][0]['target_tracks'], ['prior_switch'])
         frame[5:7, 3:5] = 0
         frame[5:7, 5:7] = 1
         self.assertEqual(core.choose_action(frame, [4]), Action.ACTION4)

@@ -76,6 +76,18 @@ class Transition:
     changed_objects: list
     global_changes: dict
 
+
+@dataclass
+class InteractionObservation:
+    goal_type: str
+    target_tracks: list[str]
+    action: str
+    contacted: bool
+    target_not_visible: list[str]
+    ui_changes: list[dict]
+    gameplay_changes: list[dict]
+    association_confidence: str
+
 @dataclass
 class SceneModel:
     controlled_entity: set[int]
@@ -2294,7 +2306,8 @@ def analyze_scene_vlm(
     traversable_color_evidence,
     previous_feedback=None,
     reanalysis_reason=None,
-    tracking_events=None,):
+    tracking_events=None,
+    causal_observations=None,):
     image_url = frame_to_data_url(frame)
     controlled_description = [
         {
@@ -2315,6 +2328,7 @@ def analyze_scene_vlm(
     ]
     verified_facts = {
         "tracking_events": tracking_events or [],
+        "causal_observations": causal_observations or [],
         "frame_shape": list(np.asarray(frame).shape),
         "component_table": {
             "columns": ["frame_id", "color", "pixel_count", "bbox_yxyx", "shape_hash", "track_id", "tracking_status", "confidence", "parent_track_ids"],
@@ -2422,6 +2436,12 @@ treat this as evidence that it was collected or activated.
 
 Look for resulting changes elsewhere in the gameplay area and infer
 the next likely subgoal.
+
+Causal observations report what changed immediately after the controlled
+entity contacted a target region. An observation marked observed_once is an
+association, not proof of a mechanic; repeated observations are stronger.
+Treat UI changes as evidence about game state, not as movement targets unless
+the game explicitly requires interacting with the UI.
 You have a limited inspection budget.
 
 Previous experimental feedback:
@@ -2822,6 +2842,8 @@ class MyAgentCore:
         self.best_goal_distances = {}
         self.evidence_revision = 0
         self.goal_experiments = {}
+        self.pending_interaction = None
+        self.mechanics_evidence = {}
         self.needs_reanalysis = False
         self.controlled_track_ids = set()
         self.goal_target_tracks = {}
@@ -2938,14 +2960,19 @@ class MyAgentCore:
     def request_reanalysis(
         self,
         reason,
-        reject_current_goal=False,):
+        reject_current_goal=False,
+        record_goal_outcome=True,):
         print(
             "[REANALYZE REQUEST]",
             reason,
             flush=True,
         )
 
-        if self.current_goal is not None and not self.needs_reanalysis:
+        if (
+            record_goal_outcome
+            and self.current_goal is not None
+            and not self.needs_reanalysis
+        ):
             self.record_goal_outcome(reason, reject_current_goal)
 
         if reject_current_goal and self.current_goal is not None:
@@ -3021,6 +3048,189 @@ class MyAgentCore:
             ))
             for _, record in sorted(self.goal_experiments.items())
         ]
+
+    @staticmethod
+    def snapshot_track(obj):
+        return {
+            "color": obj.color,
+            "shape_hash": obj.shape_hash,
+            "pixel_count": len(obj.pixels),
+            "bbox": list(obj.bbox),
+        }
+
+    def begin_interaction_observation(self, target_region_ids):
+        """Save the evidence needed to explain the result of one planned move."""
+        if self.current_goal is None or self.previous_state is None:
+            return None
+
+        ui_ids = set((self.scene_analysis or {}).get("ui_candidates", []))
+        ui_tracks = {
+            obj.track_id
+            for obj in self.previous_state
+            if obj.id in ui_ids and obj.track_id is not None
+        }
+        snapshots = {
+            obj.track_id: self.snapshot_track(obj)
+            for obj in self.previous_state
+            if (
+                obj.track_id is not None
+                and obj.track_id not in self.controlled_track_ids
+            )
+        }
+        return {
+            "goal_type": self.current_goal["type"],
+            "target_tracks": tuple(self.current_goal["target_tracks"]),
+            "target_region_pixels": frozenset(
+                get_object_pixels(self.previous_state, target_region_ids)
+            ),
+            "ui_tracks": ui_tracks,
+            "snapshots": snapshots,
+        }
+
+    def record_mechanics_observation(self, observation):
+        """Aggregate contact effects without calling a one-off animation causal."""
+        effect_tracks = tuple(sorted(
+            (change["track_id"], change["kind"], change["area"])
+            for change in (
+                observation["ui_changes"]
+                + observation["gameplay_changes"]
+            )
+        ))
+        key = (
+            tuple(observation["target_tracks"]),
+            tuple(observation["target_not_visible"]),
+            effect_tracks,
+        )
+        record = self.mechanics_evidence.setdefault(key, {
+            "goal_type": observation["goal_type"],
+            "target_tracks": list(observation["target_tracks"]),
+            "target_not_visible": list(observation["target_not_visible"]),
+            "ui_changes": observation["ui_changes"],
+            "gameplay_changes": observation["gameplay_changes"],
+            "contact_count": 0,
+            "no_effect_count": 0,
+        })
+        record["contact_count"] += 1
+        if not effect_tracks and not observation["target_not_visible"]:
+            record["no_effect_count"] += 1
+
+        if record["contact_count"] >= 2:
+            confidence = "repeated"
+        elif observation["target_not_visible"]:
+            confidence = "strong_single_observation"
+        else:
+            confidence = "observed_once"
+        record["association_confidence"] = confidence
+        observation["association_confidence"] = confidence
+        return record
+
+    def cumulative_mechanics_feedback(self):
+        return [
+            dict(record)
+            for _, record in sorted(
+                self.mechanics_evidence.items(),
+                key=lambda item: repr(item[0]),
+            )
+        ]
+
+    def observe_pending_interaction(self, objects):
+        pending = self.pending_interaction
+        self.pending_interaction = None
+        if pending is None:
+            return None
+
+        controlled_pixels = get_controlled_pixels(
+            objects, self.controlled_component_ids
+        )
+        if not (
+            controlled_pixels
+            and controlled_pixels & pending["target_region_pixels"]
+        ):
+            return None
+
+        after = {
+            obj.track_id: obj
+            for obj in objects
+            if (
+                obj.track_id is not None
+                and obj.track_id not in self.controlled_track_ids
+            )
+        }
+        changes = []
+        for track_id, before in pending["snapshots"].items():
+            current = after.get(track_id)
+            area = "ui" if track_id in pending["ui_tracks"] else "gameplay"
+            if current is None:
+                changes.append({
+                    "track_id": track_id,
+                    "kind": "not_visible",
+                    "area": area,
+                })
+                continue
+
+            current_snapshot = self.snapshot_track(current)
+            fields = [
+                name for name in ("color", "shape_hash", "pixel_count", "bbox")
+                if before[name] != current_snapshot[name]
+            ]
+            if fields:
+                changes.append({
+                    "track_id": track_id,
+                    "kind": "changed",
+                    "area": area,
+                    "fields": fields,
+                })
+
+        # A split/merge replacement has a new track ID, but its lineage still
+        # makes it an observable change to the original object.
+        known_tracks = set(pending["snapshots"])
+        for obj in after.values():
+            parents = set(obj.parent_track_ids) & known_tracks
+            if parents:
+                changes.append({
+                    "track_id": obj.track_id,
+                    "kind": "lineage_changed",
+                    "area": (
+                        "ui" if parents & pending["ui_tracks"] else "gameplay"
+                    ),
+                    "parent_tracks": sorted(parents),
+                })
+
+        target_not_visible = sorted(
+            track for track in pending["target_tracks"]
+            if track not in after
+        )
+        observation = {
+            "goal_type": pending["goal_type"],
+            "target_tracks": list(pending["target_tracks"]),
+            "action": self.previous_action.name,
+            "contacted": True,
+            "target_not_visible": target_not_visible,
+            "ui_changes": [change for change in changes if change["area"] == "ui"],
+            "gameplay_changes": [
+                change for change in changes if change["area"] == "gameplay"
+            ],
+        }
+        record = self.record_mechanics_observation(observation)
+        print("[INTERACTION EFFECT]", json.dumps(observation), flush=True)
+
+        if (
+            observation["target_not_visible"]
+            or observation["ui_changes"]
+            or observation["gameplay_changes"]
+        ):
+            self.request_reanalysis(
+                reason=(
+                    "target contact produced an observed effect: "
+                    f"ui={len(observation['ui_changes'])}, "
+                    f"gameplay={len(observation['gameplay_changes'])}, "
+                    f"confidence={record['association_confidence']}"
+                ),
+                reject_current_goal=False,
+                record_goal_outcome=False,
+            )
+
+        return observation
 
     def learn(self, action, transition):
         if action is None:
@@ -3195,6 +3405,10 @@ class MyAgentCore:
         if self.controlled_track_ids:
             self.resolve_controlled_ids(objects)
 
+        interaction_observation = self.observe_pending_interaction(objects)
+        if interaction_observation is not None:
+            new_evidence = True
+
         if (self.mode == "ACT" and self.current_goal is not None
                 and not self.needs_reanalysis
                 and not resolve_goal_target_ids(objects, self.current_goal["target_tracks"])):
@@ -3311,7 +3525,8 @@ class MyAgentCore:
     def commit_action(
         self,
         action,
-        source,):
+        source,
+        interaction_context=None,):
         controlled_pixels = (
             get_controlled_pixels(
                 self.previous_state,
@@ -3333,6 +3548,7 @@ class MyAgentCore:
             flush=True,
         )
 
+        self.pending_interaction = interaction_context
         self.previous_action = action
         self.act_steps_since_analysis += 1
 
@@ -3449,6 +3665,11 @@ class MyAgentCore:
                     self.cumulative_goal_feedback(),
                     indent=2,
                 ),
+                "mechanics=",
+                json.dumps(
+                    self.cumulative_mechanics_feedback(),
+                    indent=2,
+                ),
                 flush=True,
             )
             self.scene_analysis = analyze_scene_vlm(
@@ -3460,6 +3681,7 @@ class MyAgentCore:
                 previous_feedback=self.cumulative_goal_feedback(),
                 reanalysis_reason=self.reanalysis_reason,
                 tracking_events=self.tracker.events,
+                causal_observations=self.cumulative_mechanics_feedback(),
             )
 
             self.goal_target_tracks = (capture_goal_target_tracks(self.scene_analysis,objects,))
@@ -3593,7 +3815,15 @@ class MyAgentCore:
                     )
                     
                     if action is not None:
-                        return self.commit_action(action,"goal_planner",)
+                        return self.commit_action(
+                            action,
+                            "goal_planner",
+                            interaction_context=(
+                                self.begin_interaction_observation(
+                                    target_region_ids
+                                )
+                            ),
+                        )
                     
                     if action is None:
                         print(
