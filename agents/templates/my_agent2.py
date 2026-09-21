@@ -2835,6 +2835,7 @@ class MyAgentCore:
         self.discovery_state_attempts = defaultdict(int)
         self.action_vectors = {}
         self.scene_analysis = None
+        self.scene_role_tracks = {}
         self.action_components = {}
         self.controlled_component_ids = set()
         self.mode = "DISCOVER"
@@ -2945,6 +2946,33 @@ class MyAgentCore:
         self.controlled_component_ids = set(resolve_goal_target_ids(
             objects, self.controlled_track_ids
         ))
+
+    def capture_scene_role_tracks(self, objects):
+        """Anchor classifications to identities in the analysis frame."""
+        by_id = {obj.id: obj for obj in objects}
+        self.scene_role_tracks = {
+            role: {
+                by_id[obj_id].track_id
+                for obj_id in self.scene_analysis.get(role, [])
+                if obj_id in by_id and by_id[obj_id].track_id is not None
+            }
+            for role in ("wall_candidates", "ui_candidates")
+        }
+        self.resolve_scene_role_ids(objects)
+
+    def resolve_scene_role_ids(self, objects):
+        """Expose current component IDs to planners; retain absent identities.
+
+        Roles resolve independently, so one missing wall does not discard all
+        other walls. New split/merge identities need a fresh classification.
+        """
+        if self.scene_analysis is None:
+            return
+        for role, tracks in self.scene_role_tracks.items():
+            self.scene_analysis[role] = sorted(
+                obj.id for obj in objects
+                if obj.track_id is not None and obj.track_id in tracks
+            )
 
     def clear_navigation_memory(
         self,):
@@ -3492,6 +3520,7 @@ class MyAgentCore:
 
                 if observed_action:
                     self.check_navigation_loop(current_pixels, new_evidence)
+        self.resolve_scene_role_ids(objects)
         self.previous_state = objects
         self.previous_frame = frame.copy()
 
@@ -3738,6 +3767,7 @@ class MyAgentCore:
             )
 
             self.goal_target_tracks = (capture_goal_target_tracks(self.scene_analysis,objects,))
+            self.capture_scene_role_tracks(objects)
             print("[TARGET TRACKS]",self.goal_target_tracks,flush=True,)
 
             print("\n=== VLM SCENE ANALYSIS ===")

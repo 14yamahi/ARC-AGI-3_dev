@@ -292,6 +292,84 @@ class TestPersistentTracking(unittest.TestCase):
         self.assertEqual(tracks, [objects[0].track_id])
         self.assertEqual(M['resolve_goal_target_ids'](objects[:1], [o.track_id for o in objects]), [])
 
+    def test_wall_and_ui_roles_follow_renumbering_through_observe(self):
+        core = M['MyAgentCore']()
+        frame = np.zeros((12, 12), dtype=int)
+        frame[1, 1] = 6  # Removing this earlier component renumbers later IDs.
+        frame[4, 4] = 5
+        frame[8, 8] = 11
+        objects = core.observe(frame)
+        wall = next(o for o in objects if o.color == 5)
+        ui = next(o for o in objects if o.color == 11)
+        analysis = {
+            'wall_candidates': [wall.id], 'ui_candidates': [ui.id],
+            'important_objects': [],
+            'goal_scores': {'unknown': {'confidence': 1, 'target_ids': []}},
+        }
+        core.mode = 'ANALYZE'
+        with contextlib.redirect_stdout(io.StringIO()), patch.dict(
+            M, analyze_scene_vlm=lambda **kwargs: analysis,
+        ):
+            core.choose_action(frame, [1])
+            frame[1, 1] = 0
+            after = core.observe(frame)
+        new_wall = next(o for o in after if o.track_id == wall.track_id)
+        new_ui = next(o for o in after if o.track_id == ui.track_id)
+        self.assertNotEqual(new_wall.id, wall.id)
+        self.assertNotEqual(new_ui.id, ui.id)
+        self.assertEqual(core.scene_analysis['wall_candidates'], [new_wall.id])
+        self.assertEqual(core.scene_analysis['ui_candidates'], [new_ui.id])
+        core.current_goal = {'type': 'activate_object', 'target_tracks': [wall.track_id]}
+        pending = core.begin_interaction_observation([new_wall.id], Action.ACTION1)
+        self.assertEqual(pending['ui_tracks'], {ui.track_id})
+
+    def test_missing_role_does_not_transfer_to_reused_id_or_drop_other_walls(self):
+        core = M['MyAgentCore']()
+        wall, other_wall, ui = [obj({(0, x)}, frame_id=i)
+                                for i, x in enumerate((0, 10, 20))]
+        wall.track_id, other_wall.track_id, ui.track_id = 'wall', 'other', 'ui'
+        core.scene_analysis = {'wall_candidates': [0, 1], 'ui_candidates': [2]}
+        core.capture_scene_role_tracks([wall, other_wall, ui])
+        replacement = obj({(1, 1)}, frame_id=0)
+        replacement.track_id = 'replacement'
+        other_wall.id = 7
+        core.resolve_scene_role_ids([replacement, other_wall])
+        self.assertEqual(core.scene_analysis['wall_candidates'], [7])
+        self.assertEqual(core.scene_analysis['ui_candidates'], [])
+        wall.id, ui.id = 8, 9
+        core.resolve_scene_role_ids([replacement, wall, other_wall, ui])
+        self.assertEqual(core.scene_analysis['wall_candidates'], [7, 8])
+        self.assertEqual(core.scene_analysis['ui_candidates'], [9])
+
+    def test_reanalysis_replaces_roles_and_rejects_ambiguous_or_missing_ids(self):
+        core = M['MyAgentCore']()
+        wall = obj({(0, 0)}, frame_id=1)
+        wall.track_id = 'wall'
+        ambiguous = obj({(0, 4)}, frame_id=2)
+        core.scene_analysis = {'wall_candidates': [1, 2, 999], 'ui_candidates': []}
+        core.capture_scene_role_tracks([wall, ambiguous])
+        self.assertEqual(core.scene_analysis['wall_candidates'], [1])
+        core.scene_analysis = {'wall_candidates': [], 'ui_candidates': [1]}
+        core.capture_scene_role_tracks([wall, ambiguous])
+        wall.id = 5
+        core.resolve_scene_role_ids([wall, ambiguous])
+        self.assertEqual(core.scene_analysis['wall_candidates'], [])
+        self.assertEqual(core.scene_analysis['ui_candidates'], [5])
+        self.assertFalse(M['MyAgentCore'](1).scene_role_tracks)
+
+    def test_role_does_not_automatically_transfer_to_lineage_replacement(self):
+        core = M['MyAgentCore']()
+        parent = obj({(0, 0), (0, 1)})
+        parent.track_id = 'parent'
+        core.scene_analysis = {'wall_candidates': [parent.id], 'ui_candidates': []}
+        core.capture_scene_role_tracks([parent])
+        child = obj({(0, 0)})
+        child.track_id = 'child'
+        child.parent_track_ids = ('parent',)
+        child.tracking_status = 'lineage'
+        core.resolve_scene_role_ids([child])
+        self.assertEqual(core.scene_analysis['wall_candidates'], [])
+
     def test_target_region_expands_adjacent_marker_components_for_bfs(self):
         frame = np.full((12, 8), 3, dtype=int)
         # A 5x5 controlled object moves upward by five pixels. Its final
