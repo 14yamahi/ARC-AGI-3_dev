@@ -138,6 +138,25 @@ action([{"action": "MOUSE", "row": 12, "col": 31}])</pre>
   <p>The OpenAI client talks to <code>LOCAL_ANALYZER_BASE_URL</code> or <code>OPENAI_BASE_URL</code>, defaulting to <code>http://127.0.0.1:1234/v1</code>. The model comes from <code>INFERENCE_ANALYZER_MODEL</code> or <code>LOCAL_ANALYZER_MODEL_ID</code>. Connect, read, write, and pool timeouts have dedicated <code>MY_AGENT3_…_TIMEOUT</code> variables.</p>
   <p>If a local server rejects forced tool choice, the agent retries using automatic tool choice. If inference fails or the model never acts, the solver makes one legal non-reset fallback probe rather than silently ending the game.</p>
 
+  <h2>Optional run logs</h2>
+  <p>Logging is off by default. Set <code>MY_AGENT3_LOG_DIR</code> to write one JSONL file per game. This is useful on Kaggle because it preserves the exact chronology of model calls, generated Python, tool output, actions, and state transitions even when the notebook output is truncated.</p>
+  <pre>export MY_AGENT3_LOG_DIR=/kaggle/working/my_agent3_logs
+export MY_AGENT3_LOG_BOARDS=1       # include ASCII grids and segmentation
+export MY_AGENT3_LOG_STDOUT=1       # also mirror compact events to notebook stdout</pre>
+  <table>
+    <thead><tr><th>JSONL event</th><th>Captured information</th></tr></thead>
+    <tbody>
+      <tr><td><code>run_started</code> / <code>run_finished</code></td><td>Per-game file lifecycle.</td></tr>
+      <tr><td><code>initial_board</code> / <code>board_after_action</code></td><td>Shape, level, step, component count; with <code>MY_AGENT3_LOG_BOARDS=1</code>, full ASCII board and segmentation.</td></tr>
+      <tr><td><code>model_request</code></td><td>Selected model, level, step, valid actions, and message count.</td></tr>
+      <tr><td><code>model_response</code></td><td>Model text/reasoning, raw tool calls, and reported token usage.</td></tr>
+      <tr><td><code>python_script</code> / <code>python_result</code></td><td>The exact Python submitted by the model and its compact stdout/result.</td></tr>
+      <tr><td><code>action_requested</code> / <code>action_result</code></td><td>Validated action/data plus board-change, level-completion, game-over, done, and action-count metadata.</td></tr>
+      <tr><td><code>model_error</code> / <code>tool_choice_fallback</code></td><td>Endpoint failure details or compatibility fallback activation.</td></tr>
+    </tbody>
+  </table>
+  <div class="callout warn"><strong>Size and privacy:</strong> board snapshots and model reasoning can make logs large and may contain sensitive prompt content. Keep <code>MY_AGENT3_LOG_BOARDS</code> off unless board replay is needed, and do not publish raw logs without review.</div>
+
   <h2>Using the solver</h2>
   <pre>from agents.templates.my_agent3 import MyAgent3Solver
 

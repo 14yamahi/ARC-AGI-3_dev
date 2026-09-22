@@ -532,10 +532,21 @@ class PythonToolAgent:
             {"type": "image_url", "image_url": {"url": _image_url(board)}},
         ]}
 
+    def close(self) -> None:
+        self.client.close()
+
     def play_turn(self) -> bool:
         """Return whether a real environment action was executed."""
         before = self.runtime.actions_taken
         self.messages.append(self._turn_message())
+        self.runtime.logger.record(
+            "model_request",
+            model=self.model,
+            valid_actions=self.runtime.valid_actions(),
+            level=self.runtime.current_frame.level,
+            step=self.runtime.current_frame.step,
+            message_count=len(self.messages),
+        )
         self._evict()
         for _ in range(self.max_tool_calls):
             try:
@@ -551,14 +562,27 @@ class PythonToolAgent:
                     "tool_choice" in detail or "tool choice" in detail
                 ) and any(word in detail for word in ("unsupported", "not supported", "only", "must be")):
                     self.forced_tool_choice_supported = False
+                    self.runtime.logger.record("tool_choice_fallback", error=str(exc))
                     continue
                 self.runtime.last_error = f"{type(exc).__name__}: {exc}"
+                self.runtime.logger.record("model_error", error=self.runtime.last_error)
                 break
             except (APIConnectionError, APITimeoutError, APIStatusError) as exc:
                 self.runtime.last_error = f"{type(exc).__name__}: {exc}"
+                self.runtime.logger.record("model_error", error=self.runtime.last_error)
                 break
             message = response.choices[0].message
             calls = list(message.tool_calls or [])
+            self.runtime.logger.record(
+                "model_response",
+                content=message.content,
+                reasoning=(
+                    getattr(message, "reasoning", None)
+                    or getattr(message, "reasoning_content", None)
+                ),
+                tool_calls=[call.model_dump() for call in calls],
+                usage=response.usage.model_dump() if response.usage else None,
+            )
             dumped: dict[str, Any] = {"role": "assistant", "tool_calls": [call.model_dump() for call in calls]}
             if message.content:
                 dumped["content"] = message.content
@@ -601,7 +625,8 @@ class MyAgent3Solver(Solver):
             await self._play_one(game)
 
     async def _play_one(self, game: taaf.game.Game) -> None:
-        runtime = PythonToolRuntime(game, self.max_actions_per_game)
+        logger = RunLogger(game)
+        runtime = PythonToolRuntime(game, self.max_actions_per_game, logger)
         agent = PythonToolAgent(runtime)
         try:
             while not runtime.terminal() and runtime.actions_taken < self.max_actions_per_game:
@@ -635,6 +660,9 @@ class MyAgent3Solver(Solver):
                 if game.game_run.final_score is None:
                     with contextlib.suppress(Exception):
                         game.finish_game()
+        finally:
+            agent.close()
+            logger.close()
 
 
 # Keep the name used by the older Kaggle cell available when switching files.
