@@ -284,8 +284,9 @@ class PythonToolRuntime:
     MAX_TRACE_EVENTS = 20_000
     MAX_OUTPUT_CHARS = 6_000
 
-    def __init__(self, game: taaf.game.Game, max_actions: int) -> None:
+    def __init__(self, game: taaf.game.Game, max_actions: int, logger: RunLogger) -> None:
         self.game = game
+        self.logger = logger
         self.max_actions = max_actions
         self.actions_taken = 0
         self.history: list[TransitionView] = []
@@ -294,6 +295,7 @@ class PythonToolRuntime:
         self.last_action: str | None = None
         self.last_action_result: dict[str, Any] = {}
         self.last_error: str | None = None
+        self.logger.board("initial_board", self.current_frame)
 
     def _frame_view(self) -> FrameView:
         state = self.game.current_state
@@ -353,6 +355,7 @@ class PythonToolRuntime:
                 break
             before = self.current_frame
             action, data = self._parse_action(request)
+            self.logger.record("action_requested", action=action.name, data=data)
             self.game.execute_action(arcengine.ActionInput(id=action, data=data))
             self.actions_taken += 1
             self.previous_frame = before
@@ -369,6 +372,8 @@ class PythonToolRuntime:
             }
             self.last_action, self.last_action_result = action.name, result
             self.history.append(TransitionView(action.name, before, self.current_frame, result))
+            self.logger.record("action_result", **result)
+            self.logger.board("board_after_action", self.current_frame)
             results.append(result)
             if result["done"] or result["level_completed"]:
                 break
@@ -393,6 +398,11 @@ class PythonToolRuntime:
         events = 0
 
         def trace(frame: Any, event: str, arg: Any) -> Callable[..., Any]:
+            # action() enters ARC Engine while the model program is executing.
+            # Tracing the engine's render loop incorrectly spent this budget on
+            # framework code and raised CodeLimitExceeded inside perform_action.
+            if frame.f_code.co_filename != "<arc-python-tool>":
+                return None
             nonlocal events
             if event == "line":
                 events += 1
@@ -430,6 +440,7 @@ class PythonToolRuntime:
             return result
 
         namespace["action"] = action_wrapper
+        self.logger.record("python_script", code=code)
         try:
             with contextlib.redirect_stdout(output):
                 previous_trace = sys.gettrace()
@@ -448,7 +459,9 @@ class PythonToolRuntime:
         text = output.getvalue().strip()
         if len(text) > self.MAX_OUTPUT_CHARS:
             text = text[: self.MAX_OUTPUT_CHARS] + "\n[tool output truncated]"
-        return text or "{" + '"ok": true' + "}"
+        result = text or "{" + '"ok": true' + "}"
+        self.logger.record("python_result", output=result)
+        return result
 
 
 SYSTEM_PROMPT = """You are solving an unknown ARC-AGI-3 game efficiently.
