@@ -3516,6 +3516,40 @@ class MyAgentCore:
             for obj_id in target_ids
         )
 
+    def can_try_destination_overlap(self, goal_type, target_ids, frame, objects):
+        """Allow a verified destination to use overlap when boundary contact fails.
+
+        A movement lattice can skip over every one-cell boundary position around
+        a compact marker.  This is distinct from assuming it is safe to enter
+        an unknown wall: the fallback is limited to reach_object and repeats
+        the deterministic exclusions applied to submitted targets.
+        """
+        if goal_type != "reach_object" or not target_ids:
+            return False
+        by_id = {obj.id: obj for obj in objects}
+        if not set(target_ids) <= by_id.keys():
+            return False
+        roles = {
+            item.get("object_id"): item.get("role")
+            for item in (self.scene_analysis or {}).get("object_roles", [])
+            if isinstance(item, dict)
+        }
+        forbidden_ids = (
+            set(self.controlled_component_ids)
+            | set((self.scene_analysis or {}).get("wall_candidates", []))
+            | set((self.scene_analysis or {}).get("ui_candidates", []))
+            | set(detect_ui_candidates(
+                np.asarray(frame), objects, self.controlled_component_ids,
+            ))
+        )
+        if set(target_ids) & forbidden_ids:
+            return False
+        if any(roles.get(obj_id) in {"obstacle", "hazard"} for obj_id in target_ids):
+            return False
+        colors, counts = np.unique(np.asarray(frame), return_counts=True)
+        background_color = int(colors[np.argmax(counts)])
+        return all(by_id[obj_id].color != background_color for obj_id in target_ids)
+
     def cumulative_interaction_transitions(self):
         return [
             {
@@ -5142,6 +5176,9 @@ class MyAgentCore:
                         flush=True,
                     )
 
+                    allow_target_overlap = self.goal_allows_overlap(
+                        goal["type"], target_ids,
+                    )
                     action = choose_goal_action_bfs(
                         frame=np.asarray(frame),
                         objects=self.previous_state,
@@ -5150,10 +5187,35 @@ class MyAgentCore:
                         action_vectors=legal_action_vectors,
                         failed_moves=(self.failed_moves),
                         traversable_color_evidence=(self.traversable_color_evidence),
-                        allow_target_overlap=self.goal_allows_overlap(
-                            goal["type"], target_ids,
-                        ),
+                        allow_target_overlap=allow_target_overlap,
                     )
+
+                    # Compact destinations can be unreachable by one-cell
+                    # boundary contact when actions move a multi-pixel player
+                    # on a coarse grid.  Only after that conservative plan
+                    # fails, retry with overlap for a verified reach target.
+                    if (
+                        action is None
+                        and not allow_target_overlap
+                        and self.can_try_destination_overlap(
+                            goal["type"], target_ids, frame, self.previous_state,
+                        )
+                    ):
+                        action = choose_goal_action_bfs(
+                            frame=np.asarray(frame),
+                            objects=self.previous_state,
+                            controlled_ids=(self.controlled_component_ids),
+                            target_ids=target_region_ids,
+                            action_vectors=legal_action_vectors,
+                            failed_moves=(self.failed_moves),
+                            traversable_color_evidence=(self.traversable_color_evidence),
+                            allow_target_overlap=True,
+                        )
+                        if action is not None:
+                            print(
+                                "[BFS] using verified destination-overlap fallback",
+                                flush=True,
+                            )
                     
                     if action is not None:
                         self.route_failures[(

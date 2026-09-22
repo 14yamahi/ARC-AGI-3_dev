@@ -548,6 +548,68 @@ class TestPersistentTracking(unittest.TestCase):
         self.assertNotIn('track_id', result)
         self.assertNotIn('parent_track_ids', result)
 
+    def test_marker_uses_overlap_fallback_when_coarse_moves_skip_its_boundary(self):
+        frame = np.full((64, 64), 4, dtype=int)
+        frame[8:50, 14:54] = 3
+        # The central obstruction leaves a route around it, but a 5-pixel
+        # player can only end two pixels away from this compact cross or on it.
+        frame[30:45, 24:34] = 4
+        orange = obj(
+            {(y, x) for y in range(45, 47) for x in range(34, 39)},
+            color=2, frame_id=10,
+        )
+        blue = obj(
+            {(y, x) for y in range(47, 50) for x in range(34, 39)},
+            color=9, frame_id=11,
+        )
+        white = obj({(31, 21), (32, 21), (32, 22)}, color=0, frame_id=7)
+        gray_a = obj({(32, 20)}, color=1, frame_id=8)
+        gray_b = obj({(33, 21)}, color=1, frame_id=9)
+        objects = [orange, blue, white, gray_a, gray_b]
+        for item, track in zip(objects, ('orange', 'blue', 'white', 'gray-a', 'gray-b')):
+            item.track_id = track
+        core = M['MyAgentCore']()
+        core.controlled_component_ids = {orange.id, blue.id}
+        core.scene_analysis = {
+            'wall_candidates': [], 'ui_candidates': [],
+            'object_roles': [
+                {'object_id': item.id, 'role': 'marker', 'confidence': .8, 'evidence': 'cross'}
+                for item in (white, gray_a, gray_b)
+            ],
+        }
+        actions = {
+            Action.ACTION1: (0, -5), Action.ACTION2: (0, 5),
+            Action.ACTION3: (-5, 0), Action.ACTION4: (5, 0),
+        }
+        target_ids = [white.id, gray_a.id, gray_b.id]
+
+        self.assertFalse(core.goal_allows_overlap('reach_object', target_ids))
+        self.assertTrue(core.can_try_destination_overlap('reach_object', target_ids, frame, objects))
+        self.assertIsNone(M['choose_goal_action_bfs'](
+            frame, objects, core.controlled_component_ids, target_ids,
+            actions, {3: 4}, set(), allow_target_overlap=False,
+        ))
+        self.assertIsNotNone(M['choose_goal_action_bfs'](
+            frame, objects, core.controlled_component_ids, target_ids,
+            actions, {3: 4}, set(), allow_target_overlap=True,
+        ))
+
+    def test_overlap_fallback_rejects_declared_obstacles(self):
+        frame = np.full((12, 12), 4, dtype=int)
+        player = obj({(6, 6)}, color=1, frame_id=1)
+        target = obj({(5, 5)}, color=9, frame_id=2)
+        core = M['MyAgentCore']()
+        core.controlled_component_ids = {player.id}
+        core.scene_analysis = {
+            'wall_candidates': [], 'ui_candidates': [],
+            'object_roles': [
+                {'object_id': target.id, 'role': 'obstacle', 'confidence': .9, 'evidence': 'wall'},
+            ],
+        }
+        self.assertFalse(core.can_try_destination_overlap(
+            'reach_object', [target.id], frame, [player, target],
+        ))
+
     def test_inset_widget_inside_edge_panel_is_protected_ui_not_goal(self):
         frame = np.zeros((64, 64), dtype=int)
         player = obj({(32, 32)}, color=1, frame_id=1)
