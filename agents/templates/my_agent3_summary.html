@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>my_agent3.py — Python-tool solver guide</title>
+  <style>
+    :root { --ink:#182033; --muted:#5c6678; --paper:#f6f8fc; --card:#fff; --line:#dbe1ed; --blue:#2d62d5; --teal:#087b72; --amber:#ae6803; --violet:#6e45bf; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--paper); color:var(--ink); font:16px/1.58 system-ui,-apple-system,"Segoe UI",sans-serif; }
+    main { max-width:1080px; margin:auto; padding:44px 24px 72px; }
+    h1 { font-size:clamp(2.2rem,5vw,3.5rem); letter-spacing:-.05em; line-height:1.04; margin:8px 0 13px; }
+    h2 { margin:46px 0 12px; font-size:1.6rem; letter-spacing:-.025em; }
+    h3 { margin:0 0 8px; font-size:1.04rem; }
+    p { margin:8px 0 14px; } .lede { color:var(--muted); font-size:1.16rem; max-width:800px; }
+    .tag { display:inline-block; margin:2px 5px 2px 0; padding:3px 9px; border-radius:999px; background:#e7efff; color:#264d99; font-size:.82rem; font-weight:700; }
+    .card,.diagram { padding:20px; background:var(--card); border:1px solid var(--line); border-radius:14px; box-shadow:0 2px 7px #18203309; }
+    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(215px,1fr)); gap:14px; }
+    .card p { margin-bottom:0; color:var(--muted); }
+    .diagram { margin:18px 0; overflow-x:auto; } .flow { display:flex; align-items:stretch; gap:9px; min-width:770px; }
+    .node { flex:1; padding:13px; text-align:center; border:1px solid #cbd9fb; border-radius:10px; background:#f5f8ff; font-weight:700; }
+    .node small { display:block; margin-top:4px; color:var(--muted); font-weight:400; line-height:1.32; }
+    .node.tool { border-color:#bcded9; background:#effbf8; } .node.model { border-color:#dfcfef; background:#faf5ff; }
+    .arrow { align-self:center; color:var(--blue); font-size:1.45rem; }
+    .callout { margin:18px 0; padding:13px 16px; border-left:4px solid var(--teal); border-radius:0 10px 10px 0; background:#edfbf8; }
+    .warn { border-left-color:var(--amber); background:#fff8eb; } .violet { border-left-color:var(--violet); background:#faf5ff; }
+    code { padding:1px 4px; background:#edf0f6; border-radius:4px; font-size:.9em; }
+    pre { overflow:auto; margin:14px 0; padding:15px; background:#172033; color:#eef3ff; border-radius:10px; font:13px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace; }
+    table { width:100%; border-collapse:collapse; border:1px solid var(--line); border-radius:12px; overflow:hidden; background:#fff; }
+    th,td { padding:11px 13px; text-align:left; vertical-align:top; border-bottom:1px solid var(--line); } th { background:#f0f4fc; } tr:last-child td { border-bottom:0; }
+    ul { padding-left:22px; } li { margin:5px 0; } .tiny { color:var(--muted); font-size:.9rem; }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <span class="tag">Structure guide</span><span class="tag">agents/templates/my_agent3.py</span><span class="tag">TAAF / Kaggle</span>
+    <h1>How <code>my_agent3.py</code> works</h1>
+    <p class="lede"><code>MyAgent3</code> is a Duck-style ARC-AGI-3 solver. Instead of asking a model to fill a fixed scene-analysis schema, it gives the model one Python tool. The model can inspect a compact game representation, write small search or experiment programs, and execute legal game actions from inside that program.</p>
+  </header>
+
+  <h2>Architecture at a glance</h2>
+  <div class="diagram"><div class="flow">
+    <div class="node">TAAF game<small>Board, game state, and valid actions</small></div><div class="arrow">→</div>
+    <div class="node">PythonToolRuntime<small>Builds views, validates and executes actions</small></div><div class="arrow">→</div>
+    <div class="node model">PythonToolAgent<small>Persistent OpenAI-compatible tool conversation</small></div><div class="arrow">→</div>
+    <div class="node tool">One <code>python</code> tool<small>Ephemeral model-written code</small></div><div class="arrow">→</div>
+    <div class="node">Updated game state<small>History and frame views are refreshed</small></div>
+  </div></div>
+  <p>The outer solver owns game lifecycle. The runtime owns the only authority to call <code>game.execute_action(...)</code>. The model therefore cannot emit arbitrary action JSON directly; it must call <code>action(...)</code> in Python, which checks legality first.</p>
+
+  <h2>Main classes and responsibilities</h2>
+  <div class="grid">
+    <section class="card"><h3><code>PythonToolRuntime</code></h3><p>Maintains the live game bridge: frame views, prior frame, transitions, action count, valid-action checks, reset state, and execution of model-requested actions.</p></section>
+    <section class="card"><h3><code>PythonToolAgent</code></h3><p>Owns the OpenAI-compatible client and conversation. It sends the current board to the model, handles Python function calls, trims old context, and records endpoint errors.</p></section>
+    <section class="card"><h3><code>MyAgent3Solver</code></h3><p>TAAF entry point. Runs a game to completion, automatically resets after game-over, enforces the game action limit, and finishes runs safely on cancellation or error.</p></section>
+    <section class="card"><h3>Frame data types</h3><p><code>FrameView</code> is the model-facing snapshot. <code>TransitionView</code> preserves action, before frame, after frame, and compact result metadata.</p></section>
+  </div>
+
+  <h2>Per-game execution flow</h2>
+  <div class="diagram"><div class="flow" style="min-width:940px">
+    <div class="node">Create runtime<small>Read first board and action set</small></div><div class="arrow">→</div>
+    <div class="node model">Ask model<small>Model must call <code>python</code></small></div><div class="arrow">→</div>
+    <div class="node tool">Run code<small>Inspect state; optionally call <code>action</code></small></div><div class="arrow">→</div>
+    <div class="node">Record transition<small>Refresh views and append history</small></div><div class="arrow">→</div>
+    <div class="node">Continue / reset / finish<small>Based on engine state and action budget</small></div>
+  </div></div>
+  <ol>
+    <li><code>MyAgent3Solver._play_one</code> constructs <code>PythonToolRuntime(game, max_actions)</code> and its matching <code>PythonToolAgent</code>.</li>
+    <li>The agent sends the model a compact state summary plus an 8× nearest-neighbour board image.</li>
+    <li>The model receives only one function: <code>python(code: str)</code>.</li>
+    <li>The runtime executes the code with current variables injected. Code can make zero, one, or a short batch of real actions.</li>
+    <li>Every real action refreshes <code>current_frame</code>, <code>previous_frame</code>, <code>history</code>, <code>valid_actions</code>, and <code>last_action_result</code>.</li>
+    <li>On an engine game-over, the solver performs a legal <code>RESET</code>; on win, stopped run, or action cap, it finalizes the TAAF game.</li>
+  </ol>
+
+  <h2>What the Python tool sees</h2>
+  <p>Every tool call starts with a fresh namespace. It does not retain variables defined in a prior call; durable information is provided through the following runtime values.</p>
+  <table>
+    <thead><tr><th>Variable</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>current_frame</code></td><td>Latest <code>FrameView</code>: <code>.ascii</code>, <code>.segmentation</code>, <code>.shape</code>, <code>.step</code>, and <code>.level</code>.</td></tr>
+      <tr><td><code>previous_frame</code></td><td>State immediately before the most recent real action, or <code>None</code> before the first action.</td></tr>
+      <tr><td><code>history</code> / <code>transitions</code></td><td>Chronological <code>TransitionView</code> values with <code>.action</code>, <code>.before_frame</code>, <code>.after_frame</code>, <code>.frame</code>, and <code>.result</code>.</td></tr>
+      <tr><td><code>last_transition</code></td><td>The latest transition or <code>None</code>.</td></tr>
+      <tr><td><code>valid_actions</code></td><td>The current action names that the engine permits. The runtime rejects any other action.</td></tr>
+      <tr><td><code>last_action_result</code></td><td>Compact fields including <code>board_changed</code>, <code>level_completed</code>, <code>game_over</code>, <code>done</code>, and <code>actions_taken</code>.</td></tr>
+      <tr><td><code>action(...)</code></td><td>The sole bridge back to the game engine. It executes validated action requests and immediately refreshes all state values.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Board representation</h2>
+  <div class="grid">
+    <section class="card"><h3>ASCII grid</h3><p><code>current_frame.ascii</code> uses symbols <code>0–9</code> and <code>A–F</code> for ARC colours. It is available for precise local checks.</p></section>
+    <section class="card"><h3>Segmentation</h3><p><code>current_frame.segmentation</code> contains 4-connected same-colour components, hashes, pixel counts, bounding boxes, boundaries, containment children, and edge adjacency.</p></section>
+    <section class="card"><h3>Visual image</h3><p>The chat turn also carries an upscaled, nearest-neighbour PNG, so vision-capable models can use shape and layout information directly.</p></section>
+  </div>
+  <pre># Example: inspect only the small objects, then preserve a compact result.
+nodes = current_frame.segmentation["nodes"]
+small = [(n["id"], n["color"], n["bbox"]) for n in nodes if n["pixels"] &lt;= 8]
+result = {"small_components": small, "actions": valid_actions}</pre>
+
+  <h2>How model code takes actions</h2>
+  <p>The action API accepts a single action or a list. A list is capped so the model cannot accidentally run an unbounded plan. The model should use a single discriminating probe while uncertain, then use a short sequence only after it has verified the mechanic.</p>
+  <pre># Simple actions
+action(["ACTION1"])
+
+# A short, already-verified route
+action(["ACTION1", "ACTION1", "ACTION4"])
+
+# Coordinate action. Duck-style row/col is converted to ARC Engine x/y.
+action([{"action": "MOUSE", "row": 12, "col": 31}])</pre>
+  <div class="callout"><strong>Important:</strong> <code>action(...)</code> checks the request against the engine’s <code>valid_actions</code> on every call. It also stops a batch after a level completion or terminal result, so a stale plan cannot blindly act into the next level.</div>
+
+  <h2>Tool safety and limits</h2>
+  <p>The model-written code runs in-process, but in a restricted namespace. It is intended as a practical guardrail for a local inference model, not as a security boundary appropriate for hostile code.</p>
+  <table>
+    <thead><tr><th>Guardrail</th><th>Behavior</th></tr></thead>
+    <tbody>
+      <tr><td>Allowed imports</td><td>Only selected standard-library modules such as <code>collections</code>, <code>heapq</code>, <code>itertools</code>, <code>math</code>, <code>json</code>, and <code>re</code>.</td></tr>
+      <tr><td>Code size</td><td>Rejects code longer than 16,000 characters.</td></tr>
+      <tr><td>Instruction budget</td><td>A trace counter stops Python after 20,000 executed line events.</td></tr>
+      <tr><td>Tool output</td><td>Truncates output at 6,000 characters to keep the conversation useful.</td></tr>
+      <tr><td>Action batch</td><td><code>MY_AGENT3_MAX_BATCH_ACTIONS</code>, default 8, limits real actions from one tool execution.</td></tr>
+      <tr><td>Per-game actions</td><td><code>max_actions_per_game</code>, default 100, bounds the entire run.</td></tr>
+    </tbody>
+  </table>
+  <div class="callout warn"><strong>Deployment note:</strong> do not expose this in-process tool to untrusted users or arbitrary remote prompts. For a hostile-code threat model, execute the Python tool in an OS/container sandbox with resource limits.</div>
+
+  <h2>Conversation and endpoint behavior</h2>
+  <div class="diagram"><div class="flow" style="min-width:850px">
+    <div class="node">System prompt<small>Exploration, search, and action rules</small></div><div class="arrow">→</div>
+    <div class="node model">Recent messages<small>Bounded by message eviction</small></div><div class="arrow">→</div>
+    <div class="node tool">Tool result<small>Compact stdout/result/action metadata</small></div><div class="arrow">↺</div>
+    <div class="node">Next decision<small>Updated board and transition history</small></div>
+  </div></div>
+  <p><code>PythonToolAgent</code> retains the system prompt and recent messages, evicting older context once <code>MY_AGENT3_MESSAGE_LIMIT</code> is exceeded (default 18). It allows up to <code>MY_AGENT3_TOOL_CALLS_PER_TURN</code> model calls per outer turn (default 6).</p>
+  <p>The OpenAI client talks to <code>LOCAL_ANALYZER_BASE_URL</code> or <code>OPENAI_BASE_URL</code>, defaulting to <code>http://127.0.0.1:1234/v1</code>. The model comes from <code>INFERENCE_ANALYZER_MODEL</code> or <code>LOCAL_ANALYZER_MODEL_ID</code>. Connect, read, write, and pool timeouts have dedicated <code>MY_AGENT3_…_TIMEOUT</code> variables.</p>
+  <p>If a local server rejects forced tool choice, the agent retries using automatic tool choice. If inference fails or the model never acts, the solver makes one legal non-reset fallback probe rather than silently ending the game.</p>
+
+  <h2>Using the solver</h2>
+  <pre>from agents.templates.my_agent3 import MyAgent3Solver
+
+solver = MyAgent3Solver(max_actions_per_game=100)</pre>
+  <p>For compatibility with an older Kaggle cell that imports <code>MyAgentSolver</code>, the file also exports <code>MyAgentSolver = MyAgent3Solver</code>.</p>
+
+  <h2>How it differs from <code>my_agent2.py</code></h2>
+  <table>
+    <thead><tr><th>Concern</th><th><code>my_agent2.py</code></th><th><code>my_agent3.py</code></th></tr></thead>
+    <tbody>
+      <tr><td>Model interface</td><td>Fixed scene-analysis tools and a JSON schema.</td><td>One Python tool; the model chooses what to inspect and code.</td></tr>
+      <tr><td>Planning</td><td>Hand-built object tracking, goal selection, and BFS controller.</td><td>Model may write BFS, diffs, state search, or custom probes in Python.</td></tr>
+      <tr><td>Actions</td><td>Controller returns one action selected from specialized policies.</td><td>Python can execute validated single actions or short batches, including coordinates.</td></tr>
+      <tr><td>Memory</td><td>Specialized controller state and VLM feedback structures.</td><td>Recent conversation plus explicit transition history and current structured board view.</td></tr>
+      <tr><td>Safety role</td><td>Hard-coded semantic filters and route constraints.</td><td>Action validation, resource limits, model prompt guidance, and runtime fallback.</td></tr>
+    </tbody>
+  </table>
+
+  <p class="tiny">This document describes the current implementation in <code>agents/templates/my_agent3.py</code>. The solver requires the Kaggle/TAAF dependencies available in the intended benchmark environment.</p>
+</main>
+</body>
+</html>

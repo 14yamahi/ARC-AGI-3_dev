@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>my_agent2.py — Simple Guide</title>
+  <style>
+    :root { --ink:#172033; --muted:#5d687c; --paper:#f7f8fc; --card:#fff; --line:#dbe1ee; --blue:#2864dc; --teal:#097e76; --amber:#b86900; --red:#b74343; }
+    * { box-sizing:border-box; }
+    body { margin:0; color:var(--ink); background:var(--paper); font:16px/1.58 system-ui,-apple-system,"Segoe UI",sans-serif; }
+    main { max-width:1050px; margin:auto; padding:42px 24px 64px; }
+    h1 { font-size:clamp(2rem,5vw,3.35rem); letter-spacing:-.045em; line-height:1.05; margin:0 0 12px; }
+    h2 { margin:44px 0 12px; font-size:1.55rem; letter-spacing:-.02em; }
+    h3 { margin:0 0 8px; font-size:1.05rem; }
+    p { margin:8px 0 14px; } .lede { max-width:780px; font-size:1.16rem; color:var(--muted); }
+    .tag { display:inline-block; margin:2px 5px 2px 0; padding:3px 9px; border-radius:999px; background:#e8efff; color:#244d9d; font-size:.82rem; font-weight:650; }
+    .card, .diagram { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:20px; box-shadow:0 2px 6px #17203308; }
+    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:14px; }
+    .card p { color:var(--muted); margin-bottom:0; }
+    .diagram { overflow-x:auto; margin:18px 0; }
+    .flow { display:flex; align-items:stretch; gap:9px; min-width:720px; }
+    .node { flex:1; padding:13px; border-radius:10px; background:#f5f8ff; border:1px solid #cbd9fb; text-align:center; font-weight:650; }
+    .node small { display:block; margin-top:4px; color:var(--muted); font-weight:400; line-height:1.3; }
+    .arrow { align-self:center; color:var(--blue); font-size:1.45rem; }
+    .state { min-width:125px; padding:12px; border:2px solid var(--blue); border-radius:9px; text-align:center; font-weight:700; background:#f7faff; }
+    .state small { display:block; color:var(--muted); font-weight:400; font-size:.8rem; }
+    .state.warn { border-color:var(--amber); background:#fffaf2; } .state.done { border-color:var(--teal); background:#f3fffc; }
+    .callout { border-left:4px solid var(--teal); background:#edfbf8; padding:12px 15px; border-radius:0 10px 10px 0; }
+    .warn { border-left-color:var(--amber); background:#fff8eb; }
+    ul { padding-left:22px; } li { margin:5px 0; }
+    code { padding:1px 4px; background:#edf0f6; border-radius:4px; font-size:.9em; }
+    table { width:100%; border-collapse:collapse; background:white; border:1px solid var(--line); border-radius:12px; overflow:hidden; }
+    th, td { padding:11px 13px; text-align:left; vertical-align:top; border-bottom:1px solid var(--line); } th { background:#f0f4fc; } tr:last-child td { border:0; }
+    .tiny { color:var(--muted); font-size:.9rem; }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="tag">Current source summary</div><div class="tag">agents/templates/my_agent2.py</div>
+    <h1>A practical guide to <code>my_agent2.py</code></h1>
+    <p class="lede">This file implements an ARC-style game-playing agent. It first learns which buttons move the player, asks a vision-language model (VLM) what the puzzle may require, then plans cautious moves while remembering what worked, failed, changed, or caused a reset.</p>
+  </header>
+
+  <h2>The whole idea in one diagram</h2>
+  <div class="diagram">
+    <div class="flow">
+      <div class="node">Game frame<small>A small grid of colour IDs</small></div><div class="arrow">→</div>
+      <div class="node">See objects<small>Connected colour regions + tracking</small></div><div class="arrow">→</div>
+      <div class="node">Learn controls<small>Which action moves the player?</small></div><div class="arrow">→</div>
+      <div class="node">Interpret scene<small>VLM proposes walls, UI, goals, roles</small></div><div class="arrow">→</div>
+      <div class="node">Plan &amp; act<small>Safe BFS route or exploration</small></div><div class="arrow">→</div>
+      <div class="node">Observe result<small>Update movement, mechanics, and goals</small></div>
+    </div>
+  </div>
+
+  <h2>What it contains</h2>
+  <div class="grid">
+    <section class="card"><h3>1. Scene perception</h3><p>Turns the numbered ARC grid into coloured connected components, each with pixels, size, bounding box, centre, and a shape fingerprint.</p></section>
+    <section class="card"><h3>2. Object tracking</h3><p>Gives components persistent track IDs across frames. It tries to identify moves, appearances, disappearances, and split/merge lineage without making risky guesses.</p></section>
+    <section class="card"><h3>3. Scene interpretation</h3><p>Sends the grid image and verified facts to a local OpenAI-compatible VLM. The model must return structured JSON; local checks reject unsafe targets.</p></section>
+    <section class="card"><h3>4. Controller</h3><p><code>MyAgentCore</code> runs the state machine, learns action effects, plans routes, detects loops, and decides when the VLM should reconsider.</p></section>
+    <section class="card"><h3>5. Benchmark wrapper</h3><p><code>MyAgentSolver</code> runs one agent per game, handles reset/win/cancellation, and caps actions at 100 per game.</p></section>
+  </div>
+
+  <h2>1. How it sees a frame</h2>
+  <p><code>extract_objects(frame)</code> flood-fills every 4-neighbour connected region of the same colour. At present, it does <em>not</em> exclude a background colour, so even large background regions become components. <code>frame_to_data_url</code> also converts the grid to a PNG for the VLM using the file’s ARC colour palette.</p>
+  <div class="diagram">
+    <div class="flow" style="min-width:620px">
+      <div class="node">Grid cells<small>Colour numbers 0–15</small></div><div class="arrow">→</div>
+      <div class="node">Flood fill<small>Same colour + up/down/left/right</small></div><div class="arrow">→</div>
+      <div class="node">GameObject<small>pixels, colour, bbox, centre, shape hash</small></div><div class="arrow">→</div>
+      <div class="node">ObjectTracker<small>persistent <code>track_id</code></small></div>
+    </div>
+  </div>
+  <p>The tracker uses a global one-to-one matching algorithm, shape/overlap/distance scores, ambiguity margins, and explicit split/merge detection. If identity is unclear, it leaves an object ambiguous instead of confidently inventing a replacement.</p>
+
+  <h2>2. The operating modes</h2>
+  <p>The core controller has three modes. Most calls enter through <code>MyAgentCore.choose_action(frame, available_actions)</code>.</p>
+  <div class="diagram">
+    <div class="flow" style="min-width:760px">
+      <div class="state">DISCOVER<small>Try actions and learn movement vectors</small></div><div class="arrow">→</div>
+      <div class="state">ANALYZE<small>Ask the VLM for a structured scene model</small></div><div class="arrow">→</div>
+      <div class="state done">ACT<small>Route to a goal or explore</small></div><div class="arrow">↺</div>
+      <div class="state warn">ANALYZE again<small>After a change, stall, loop, or unsafe route</small></div>
+    </div>
+  </div>
+  <table>
+    <thead><tr><th>Mode</th><th>Simple explanation</th><th>Key limit</th></tr></thead>
+    <tbody>
+      <tr><td><code>DISCOVER</code></td><td>Experiments with ACTION1–ACTION4. Comparing frames reveals action vectors and the component that moves under every learned movement action: the player.</td><td>Up to 16 discovery steps.</td></tr>
+      <tr><td><code>ANALYZE</code></td><td>Builds factual context and asks the VLM to classify the board and propose possible goals.</td><td>At most 6 inspections and 13 total VLM tool steps.</td></tr>
+      <tr><td><code>ACT</code></td><td>Chooses the strongest safe, supported goal; otherwise learns the map by exploration.</td><td>Requests reanalysis after 6 actions without useful evidence.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>3. What the VLM is allowed to decide</h2>
+  <p><code>analyze_scene_vlm</code> sends a screenshot plus deterministic facts: component table, player IDs, known action vectors, traversable colours, tracking events, earlier experiment feedback, and interaction/pattern evidence. The VLM can inspect selected scene facts and then submit a JSON analysis.</p>
+  <div class="diagram">
+    <div class="flow" style="min-width:700px">
+      <div class="node">Verified input<small>image + component table + history</small></div><div class="arrow">→</div>
+      <div class="node">VLM tools<small><code>inspect_scene</code> (optional)</small></div><div class="arrow">→</div>
+      <div class="node">Structured submission<small>walls, UI, roles, goals, pattern idea</small></div><div class="arrow">→</div>
+      <div class="node">Local validator<small>accept / explain rejection / retry</small></div>
+    </div>
+  </div>
+  <p>It scores these goal types: <code>reach_object</code>, <code>match_pattern</code>, <code>collect_objects</code>, <code>activate_object</code>, <code>move_into_region</code>, <code>transform_shape</code>, and <code>unknown</code>. Only the first four are currently sent through the ordinary movement planner; <code>match_pattern</code> can become a normal reach goal only after a stricter pattern condition is proven.</p>
+  <div class="callout"><strong>Important safety boundary:</strong> the VLM never receives internal tracker IDs as usable object IDs. It sees only current-frame IDs, which avoids mixing permanent identity labels with the IDs valid in this screenshot.</div>
+
+  <h2>4. Safety checks before planning</h2>
+  <p><code>validate_scene_analysis</code> distrusts unsafe or malformed model output. It normalizes a few common local-model JSON mistakes, then rejects or removes targets that are the player, UI, edge panels, declared walls/hazards, missing/ambiguous objects, or components in the modal background colour.</p>
+  <div class="grid">
+    <section class="card"><h3>UI protection</h3><p>Edge-adjacent components and small components inside edge panels are treated as UI. Stable near-edge indicators can also become state-display evidence.</p></section>
+    <section class="card"><h3>Terrain learning</h3><p>A colour becomes “verified traversable” after it has been entered successfully at least twice. This is stronger evidence than a visual guess.</p></section>
+    <section class="card"><h3>Identity protection</h3><p>Goals are stored using tracker IDs, then resolved back to current frame IDs before each move. Missing part of a target group means no partial plan.</p></section>
+  </div>
+
+  <h2>5. How a move is chosen</h2>
+  <div class="diagram">
+    <div class="flow" style="min-width:900px">
+      <div class="node">Select best goal<small>confidence minus failure penalties</small></div><div class="arrow">→</div>
+      <div class="node">Resolve current target<small>track IDs → this frame’s IDs</small></div><div class="arrow">→</div>
+      <div class="node">BFS path search<small>only known walkable cells; avoid past failed moves</small></div><div class="arrow">→</div>
+      <div class="node">Frontier plan<small>walk learned graph to an untested action</small></div><div class="arrow">→</div>
+      <div class="node">Heuristic explore<small>prefer new / known walkable positions</small></div>
+    </div>
+  </div>
+  <p>The goal planner uses breadth-first search. It stays in bounds, travels only through colours with repeated traversability evidence, and normally stops beside a target instead of entering it. Entering a target is permitted only when its VLM role makes that safe (for example, a key, switch, collectible, exit, door, or portal), with a narrow fallback for verified reach targets.</p>
+  <p>If no proven route exists, the agent first searches its learned movement graph for the closest state with an untested action. If that also fails, it uses a simple exploration score that avoids known walls and frequently revisited states.</p>
+
+  <h2>6. Learning from outcomes</h2>
+  <p>After every action, <code>observe</code> compares old and new tracked objects. In ACT mode it learns a transition graph for the player, records blocked state/action pairs, and increments evidence when a move, new state, new edge, or better goal distance is found.</p>
+  <div class="diagram">
+    <div class="flow" style="min-width:790px">
+      <div class="node">Planned contact<small>save target and before snapshots</small></div><div class="arrow">→</div>
+      <div class="node">Next frame<small>compare tracked components</small></div><div class="arrow">→</div>
+      <div class="node">Mechanics evidence<small>target vanished? UI/gameplay changed?</small></div><div class="arrow">→</div>
+      <div class="node">Reanalyze if useful<small>new effects, topology change, loop, stall</small></div>
+    </div>
+  </div>
+  <p>Interaction records deliberately distinguish one observation from repeatable evidence. The agent keeps goal failure penalties, remembers visually unsafe targets after a reset, detects movement loops, clears obsolete navigation memory if board topology changes, and supplies this history to the next VLM analysis.</p>
+
+  <h2>Pattern and UI handling</h2>
+  <p>This is one of the more careful parts of the file. A small, stable UI object may be a state display rather than a goal. After an interaction changes such a display, the agent compares display shapes with small gameplay components (including rotations) and gives the VLM a bounded “pattern relation” context.</p>
+  <div class="callout warn"><strong>Rule:</strong> a UI display can explain the next goal, but it must never itself become a navigation target. A pattern goal is materialized only when the VLM marks the condition as matched and names exactly one non-UI gameplay pattern cluster to navigate to.</div>
+
+  <h2>Entry points and configuration</h2>
+  <table>
+    <thead><tr><th>Item</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>MyAgentCore.choose_action</code></td><td>Main synchronous decision function: observes, changes modes, analyses, plans, and returns a game action.</td></tr>
+      <tr><td><code>MyAgentSolver._play_one</code></td><td>Async game loop: reads frames, calls the core, executes actions, handles wins/game-over/reset, and finishes the game.</td></tr>
+      <tr><td><code>LOCAL_ANALYZER_BASE_URL</code> / <code>OPENAI_BASE_URL</code></td><td>OpenAI-compatible endpoint for the VLM; default is <code>http://127.0.0.1:1234/v1</code>.</td></tr>
+      <tr><td><code>INFERENCE_ANALYZER_MODEL</code> / <code>LOCAL_ANALYZER_MODEL_ID</code></td><td>Model name; default is <code>vrfai/Qwen3.6-27B-FP8</code>.</td></tr>
+      <tr><td><code>LOCAL_ANALYZER_API_KEY</code> / <code>OPENAI_API_KEY</code></td><td>API key; default is <code>local</code>.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Plain-English takeaway</h2>
+  <p><strong>This is an experimental, safety-minded puzzle agent.</strong> It does not assume it knows the controls, the player, walkable terrain, UI, or objective. It learns those pieces from observations, lets a VLM suggest semantic meaning, locally filters unsafe suggestions, navigates only with evidence, and revises its hypothesis when the game contradicts it.</p>
+  <p class="tiny">Summary based on the current <code>agents/templates/my_agent2.py</code>. It describes the implementation’s intended control flow; actual puzzle performance still depends on the game engine, the local VLM, and the evidence available in each level.</p>
+</main>
+</body>
+</html>
