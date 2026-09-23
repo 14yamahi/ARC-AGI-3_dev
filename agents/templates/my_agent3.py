@@ -23,7 +23,7 @@ import sys
 import time
 import traceback
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -83,11 +83,24 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
+    try:
+        return max(minimum, float(os.getenv(name, default)))
+    except ValueError:
+        return default
+
+
 class RunLogger:
-    """Optional structured run log; disabled unless MY_AGENT3_LOG_DIR is set."""
+    """Structured run log, enabled by default outside competition reruns."""
 
     def __init__(self, game: Any) -> None:
+        # Development runs need their model-error chronology to be useful.  Keep
+        # competition reruns quiet by default, while allowing either mode to be
+        # overridden explicitly with MY_AGENT3_LOG_DIR (an empty value disables it).
         root = os.getenv("MY_AGENT3_LOG_DIR")
+        if root is None and not _env_bool("TAAF_RUN_AS_SUBMISSION"):
+            kaggle_working = Path("/kaggle/working")
+            root = str(kaggle_working / "my_agent3_logs") if kaggle_working.is_dir() else "my_agent3_logs"
         self.file: Any | None = None
         self.include_boards = _env_bool("MY_AGENT3_LOG_BOARDS")
         self.stdout = _env_bool("MY_AGENT3_LOG_STDOUT")
@@ -185,71 +198,81 @@ def _image_url(board: np.ndarray) -> str:
 
 
 def _components(board: np.ndarray) -> dict[str, Any]:
-    """Return compact 4-connected components, containment, and adjacency."""
+    """Return compact components in O(board area), with bounded containment."""
     height, width = board.shape
-    seen: set[tuple[int, int]] = set()
+    labels = np.full((height, width), -1, dtype=np.int32)
     nodes: list[dict[str, Any]] = []
     for row in range(height):
         for col in range(width):
-            if (row, col) in seen:
+            if labels[row, col] >= 0:
                 continue
             color = int(board[row, col])
             queue = deque([(row, col)])
-            seen.add((row, col))
+            component_id = len(nodes)
+            labels[row, col] = component_id
             pixels: set[tuple[int, int]] = set()
+            ordered_pixels: list[tuple[int, int]] = []
+            min_y = max_y = row
+            min_x = max_x = col
             while queue:
                 y, x = queue.popleft()
                 pixels.add((y, x))
+                ordered_pixels.append((y, x))
+                min_y, max_y = min(min_y, y), max(max_y, y)
+                min_x, max_x = min(min_x, x), max(max_x, x)
                 for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
                     if (
                         0 <= ny < height and 0 <= nx < width
-                        and (ny, nx) not in seen and int(board[ny, nx]) == color
+                        and labels[ny, nx] < 0 and int(board[ny, nx]) == color
                     ):
-                        seen.add((ny, nx))
+                        labels[ny, nx] = component_id
                         queue.append((ny, nx))
-            ys = [p[0] for p in pixels]
-            xs = [p[1] for p in pixels]
-            min_y, max_y, min_x, max_x = min(ys), max(ys), min(xs), max(xs)
-            normal = sorted((y - min_y, x - min_x) for y, x in pixels)
+            # BFS starts at the component's top-left-most cell and has a fixed
+            # neighbour order, so ordered_pixels is a deterministic shape key
+            # without an O(component_size log component_size) sort.
+            normal = [(y - min_y, x - min_x) for y, x in ordered_pixels]
             digest = hashlib.sha1(repr((color, normal)).encode()).hexdigest()[:12]
-            boundary = sorted(
+            boundary = [
                 (y, x) for y, x in pixels
                 if any((y + dy, x + dx) not in pixels for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)))
-            )
+            ]
             nodes.append({
                 "id": len(nodes), "color": COLOR_SYMBOLS[color] if 0 <= color < 16 else "?",
                 "color_id": color, "hash": digest, "pixels": len(pixels),
-                "bbox": [min_y, min_x, max_y, max_x], "boundary": boundary[:128],
-                "_pixels": pixels,
+                "bbox": [min_y, min_x, max_y, max_x], "boundary": boundary[:128], "children": [],
             })
 
+    # Every adjacent component pair appears on a horizontal or vertical grid
+    # edge.  Scanning those edges avoids comparing every pair of objects.
     adjacency: set[tuple[int, int]] = set()
-    for i, left in enumerate(nodes):
-        for j, right in enumerate(nodes[i + 1 :], i + 1):
-            if any(
-                (y + dy, x + dx) in right["_pixels"]
-                for y, x in left["_pixels"] for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1))
-            ):
-                adjacency.add((i, j))
+    for left, right in ((labels[:, :-1], labels[:, 1:]), (labels[:-1, :], labels[1:, :])):
+        changed = left != right
+        for first, second in zip(left[changed].tolist(), right[changed].tolist()):
+            adjacency.add((min(first, second), max(first, second)))
 
-    for node in nodes:
-        node["children"] = []
-    for child in nodes:
-        y1, x1, y2, x2 = child["bbox"]
-        containers = []
-        for parent in nodes:
-            if parent["id"] == child["id"]:
-                continue
-            py1, px1, py2, px2 = parent["bbox"]
-            if py1 <= y1 and px1 <= x1 and py2 >= y2 and px2 >= x2:
-                containers.append(parent)
-        if containers:
-            parent = min(containers, key=lambda item: item["pixels"])
-            parent.setdefault("children", []).append(child["id"])
-
-    for node in nodes:
-        node.pop("_pixels")
-    return {"nodes": nodes, "adjacency_list": [list(edge) for edge in sorted(adjacency)]}
+    # Bounding-box containment is useful for small object scenes, but an O(n²)
+    # relation is not acceptable for highly fragmented boards.  It is omitted
+    # above this cap rather than delaying the first inference request.
+    containment_cap = _env_int("MY_AGENT3_MAX_CONTAINMENT_NODES", 128)
+    containment_truncated = len(nodes) > containment_cap
+    if not containment_truncated:
+        for child in nodes:
+            y1, x1, y2, x2 = child["bbox"]
+            containers = []
+            for parent in nodes:
+                if parent["id"] == child["id"]:
+                    continue
+                py1, px1, py2, px2 = parent["bbox"]
+                if py1 <= y1 and px1 <= x1 and py2 >= y2 and px2 >= x2:
+                    containers.append(parent)
+            if containers:
+                parent = min(containers, key=lambda item: item["pixels"])
+                parent["children"].append(child["id"])
+    return {
+        "nodes": nodes,
+        "adjacency_list": [list(edge) for edge in sorted(adjacency)],
+        "containment_truncated": containment_truncated,
+    }
 
 
 @dataclass
@@ -338,6 +361,8 @@ class PythonToolRuntime:
         action = _game_action(raw)
         if action.name not in self.valid_actions():
             raise ValueError(f"{action.name} is not currently legal; valid_actions={self.valid_actions()}")
+        if action.name == "MOUSE" and not {"x", "y"}.issubset(params):
+            raise ValueError("MOUSE requires both x and y (or row and col)")
         return action, params
 
     def action(self, requests: Any) -> list[dict[str, Any]]:
@@ -535,6 +560,54 @@ class PythonToolAgent:
     def close(self) -> None:
         self.client.close()
 
+    def preflight(self) -> bool:
+        """Verify the exact multimodal, required-tool request before playing."""
+        timeout = _env_float("MY_AGENT3_PREFLIGHT_TIMEOUT", 45.0, 1.0)
+        messages = [self.messages[0], self._turn_message()]
+        started = time.monotonic()
+        self.runtime.logger.record(
+            "model_preflight_request", model=self.model, timeout_s=timeout,
+            valid_actions=self.runtime.valid_actions(),
+        )
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model, messages=messages, tools=[PYTHON_TOOL], tool_choice="required",
+                temperature=0, max_tokens=256, timeout=timeout,
+                extra_body={"chat_template_kwargs": {"enable_thinking": True}},
+            )
+        except Exception as exc:
+            self.runtime.last_error = f"preflight {type(exc).__name__}: {exc}"
+            self.runtime.logger.record(
+                "model_preflight_error", error=self.runtime.last_error,
+                duration_s=round(time.monotonic() - started, 3),
+            )
+            return False
+
+        choices = list(getattr(response, "choices", []) or [])
+        message = choices[0].message if choices else None
+        calls = list(getattr(message, "tool_calls", None) or [])
+        valid_call = False
+        for call in calls:
+            if call.function.name != "python":
+                continue
+            try:
+                arguments = json.loads(call.function.arguments or "{}")
+            except json.JSONDecodeError:
+                continue
+            if isinstance(arguments.get("code"), str) and arguments["code"].strip():
+                valid_call = True
+                break
+        self.runtime.logger.record(
+            "model_preflight_response", duration_s=round(time.monotonic() - started, 3),
+            valid_tool_call=valid_call,
+            tool_calls=[call.model_dump() for call in calls],
+            usage=response.usage.model_dump() if response.usage else None,
+        )
+        if not valid_call:
+            self.runtime.last_error = "preflight did not return a valid python tool call"
+            self.runtime.logger.record("model_preflight_error", error=self.runtime.last_error)
+        return valid_call
+
     def play_turn(self) -> bool:
         """Return whether a real environment action was executed."""
         before = self.runtime.actions_taken
@@ -549,6 +622,7 @@ class PythonToolAgent:
         )
         self._evict()
         for _ in range(self.max_tool_calls):
+            request_started = time.monotonic()
             try:
                 response = self.client.chat.completions.create(
                     model=self.model, messages=self.messages, tools=[PYTHON_TOOL],
@@ -562,14 +636,23 @@ class PythonToolAgent:
                     "tool_choice" in detail or "tool choice" in detail
                 ) and any(word in detail for word in ("unsupported", "not supported", "only", "must be")):
                     self.forced_tool_choice_supported = False
-                    self.runtime.logger.record("tool_choice_fallback", error=str(exc))
+                    self.runtime.logger.record(
+                        "tool_choice_fallback", error=str(exc),
+                        duration_s=round(time.monotonic() - request_started, 3),
+                    )
                     continue
                 self.runtime.last_error = f"{type(exc).__name__}: {exc}"
-                self.runtime.logger.record("model_error", error=self.runtime.last_error)
+                self.runtime.logger.record(
+                    "model_error", error=self.runtime.last_error,
+                    duration_s=round(time.monotonic() - request_started, 3),
+                )
                 break
             except (APIConnectionError, APITimeoutError, APIStatusError) as exc:
                 self.runtime.last_error = f"{type(exc).__name__}: {exc}"
-                self.runtime.logger.record("model_error", error=self.runtime.last_error)
+                self.runtime.logger.record(
+                    "model_error", error=self.runtime.last_error,
+                    duration_s=round(time.monotonic() - request_started, 3),
+                )
                 break
             message = response.choices[0].message
             calls = list(message.tool_calls or [])
@@ -582,6 +665,7 @@ class PythonToolAgent:
                 ),
                 tool_calls=[call.model_dump() for call in calls],
                 usage=response.usage.model_dump() if response.usage else None,
+                duration_s=round(time.monotonic() - request_started, 3),
             )
             dumped: dict[str, Any] = {"role": "assistant", "tool_calls": [call.model_dump() for call in calls]}
             if message.content:
@@ -616,7 +700,8 @@ class MyAgent3Solver(Solver):
     """TAAF entry point. Set the Kaggle solver to ``MyAgent3Solver``."""
 
     label: str = "MyAgent3"
-    max_actions_per_game: int = 100
+    max_actions_per_game: int = 10
+    _preflight_ok: bool | None = field(default=None, init=False, repr=False)
 
     async def _run_games(self, games: list[taaf.game.Game]) -> None:
         # Inference is synchronous. Running games sequentially prevents one
@@ -629,6 +714,11 @@ class MyAgent3Solver(Solver):
         runtime = PythonToolRuntime(game, self.max_actions_per_game, logger)
         agent = PythonToolAgent(runtime)
         try:
+            if self._preflight_ok is None:
+                self._preflight_ok = agent.preflight()
+            if not self._preflight_ok:
+                logger.record("solver_stopped", reason="model_preflight_failed", error=runtime.last_error)
+                return
             while not runtime.terminal() and runtime.actions_taken < self.max_actions_per_game:
                 await asyncio.sleep(0)
                 if runtime.game_over():
@@ -639,13 +729,14 @@ class MyAgent3Solver(Solver):
                 did_act = agent.play_turn()
                 if did_act:
                     continue
-                # A model/server failure must not silently terminate a game.
-                # Make one legal, non-reset probe and expose the result next turn.
-                legal = runtime.valid_actions()
-                fallback = next((name for name in legal if name != "RESET"), legal[0] if legal else None)
-                if fallback is None:
-                    break
-                runtime.action([fallback])
+                # Never guess an action after an inference failure.  In
+                # particular, MOUSE is legal in some games but requires x/y;
+                # an unparameterized fallback previously crashed those games.
+                logger.record(
+                    "solver_stopped", reason="model_did_not_act", error=runtime.last_error,
+                    actions_taken=runtime.actions_taken,
+                )
+                break
             if game.game_run is not None and game.game_run.final_score is None:
                 game.finish_game()
         except asyncio.CancelledError:
