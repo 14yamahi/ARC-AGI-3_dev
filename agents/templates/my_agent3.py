@@ -22,7 +22,7 @@ import os
 import sys
 import time
 import traceback
-from collections import deque
+from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -124,7 +124,10 @@ class RunLogger:
             self.file.flush()
         if self.stdout:
             preview = json.dumps(payload, default=str)[:2_000]
-            print(f"[MYAGENT3 {event}] {preview}", flush=True)
+            # Python tool code is run under redirect_stdout().  Mirrored
+            # diagnostics must not become accidental, often huge, model tool
+            # output; keep them on the original process stream instead.
+            print(f"[MYAGENT3 {event}] {preview}", file=sys.__stdout__, flush=True)
 
     def board(self, event: str, frame: "FrameView") -> None:
         payload: dict[str, Any] = {
@@ -275,6 +278,461 @@ def _components(board: np.ndarray) -> dict[str, Any]:
     }
 
 
+def _component_brief(node: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: node[key]
+        for key in ("id", "color", "pixels", "bbox", "hash")
+    }
+
+
+def _bbox_distance(left: dict[str, Any], right: dict[str, Any]) -> int:
+    """Manhattan distance between component bounding-box centres, in grid cells."""
+    ly1, lx1, ly2, lx2 = left["bbox"]
+    ry1, rx1, ry2, rx2 = right["bbox"]
+    return abs((ly1 + ly2) - (ry1 + ry2)) + abs((lx1 + lx2) - (rx1 + rx2))
+
+
+def _transition_summary(
+    before_board: np.ndarray,
+    after_board: np.ndarray,
+    before_segmentation: dict[str, Any],
+    after_segmentation: dict[str, Any],
+) -> dict[str, Any]:
+    """Describe a transition compactly enough to be useful in a tool response."""
+    changed = before_board != after_board
+    coordinates = np.argwhere(changed)
+    changed_count = int(len(coordinates))
+    cell_summary: dict[str, Any] = {"count": changed_count}
+    if changed_count:
+        min_y, min_x = coordinates.min(axis=0).tolist()
+        max_y, max_x = coordinates.max(axis=0).tolist()
+        cell_summary["bbox"] = [int(min_y), int(min_x), int(max_y), int(max_x)]
+        color_changes = Counter(
+            (int(before_board[y, x]), int(after_board[y, x]))
+            for y, x in coordinates
+        )
+        cell_summary["color_changes"] = [
+            {
+                "from": COLOR_SYMBOLS[before] if 0 <= before < len(COLOR_SYMBOLS) else "?",
+                "to": COLOR_SYMBOLS[after] if 0 <= after < len(COLOR_SYMBOLS) else "?",
+                "cells": count,
+            }
+            for (before, after), count in color_changes.most_common(12)
+        ]
+        sample_cap = _env_int("MY_AGENT3_CHANGE_CELL_SAMPLES", 24)
+        cell_summary["samples"] = [
+            {
+                "row": int(y), "col": int(x),
+                "from": COLOR_SYMBOLS[int(before_board[y, x])],
+                "to": COLOR_SYMBOLS[int(after_board[y, x])],
+            }
+            for y, x in coordinates[:sample_cap]
+        ]
+
+    before_nodes = before_segmentation["nodes"]
+    after_nodes = after_segmentation["nodes"]
+    tracking_cap = _env_int("MY_AGENT3_MAX_TRACKED_COMPONENTS", 256)
+    tracking_truncated = len(before_nodes) > tracking_cap or len(after_nodes) > tracking_cap
+    moved: list[dict[str, Any]] = []
+    appeared: list[dict[str, Any]] = []
+    disappeared: list[dict[str, Any]] = []
+    if not tracking_truncated:
+        # A colour/shape/pixel-count match is a conservative identity cue.  It
+        # handles translated players without pretending that local node ids are
+        # persistent.  Ambiguous duplicates are paired by nearest position.
+        before_groups: dict[tuple[int, str, int], list[dict[str, Any]]] = defaultdict(list)
+        after_groups: dict[tuple[int, str, int], list[dict[str, Any]]] = defaultdict(list)
+        for node in before_nodes:
+            before_groups[(node["color_id"], node["hash"], node["pixels"])].append(node)
+        for node in after_nodes:
+            after_groups[(node["color_id"], node["hash"], node["pixels"])].append(node)
+
+        unmatched_before = {node["id"] for node in before_nodes}
+        unmatched_after = {node["id"] for node in after_nodes}
+        before_by_id = {node["id"]: node for node in before_nodes}
+        after_by_id = {node["id"]: node for node in after_nodes}
+        for signature, prior_nodes in before_groups.items():
+            remaining = list(after_groups.get(signature, []))
+            for prior in prior_nodes:
+                if not remaining:
+                    break
+                current = min(remaining, key=lambda node: _bbox_distance(prior, node))
+                remaining.remove(current)
+                unmatched_before.discard(prior["id"])
+                unmatched_after.discard(current["id"])
+                before_bbox, after_bbox = prior["bbox"], current["bbox"]
+                row_delta = int(after_bbox[0] - before_bbox[0])
+                col_delta = int(after_bbox[1] - before_bbox[1])
+                if row_delta or col_delta:
+                    moved.append({
+                        "before_id": prior["id"], "after_id": current["id"],
+                        "color": prior["color"], "pixels": prior["pixels"], "hash": prior["hash"],
+                        "before_bbox": before_bbox, "after_bbox": after_bbox,
+                        "row_delta": row_delta, "col_delta": col_delta,
+                        "row_delta_note": "negative is up; positive is down",
+                        "col_delta_note": "negative is left; positive is right",
+                    })
+        component_cap = _env_int("MY_AGENT3_COMPONENT_CHANGE_SAMPLES", 16)
+        appeared = [_component_brief(after_by_id[node_id]) for node_id in sorted(unmatched_after)[:component_cap]]
+        disappeared = [_component_brief(before_by_id[node_id]) for node_id in sorted(unmatched_before)[:component_cap]]
+
+    return {
+        "cells": cell_summary,
+        "moved_components": moved[:_env_int("MY_AGENT3_MOVEMENT_SAMPLES", 16)],
+        "appeared_components": appeared,
+        "disappeared_components": disappeared,
+        "tracking_truncated": tracking_truncated,
+    }
+
+
+def _region_array(
+    board: np.ndarray, row: int, col: int, height: int, width: int,
+) -> np.ndarray:
+    """Validate and extract a deliberately small board crop."""
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in (row, col, height, width)):
+        raise TypeError("row, col, height, and width must be integers")
+    if height <= 0 or width <= 0:
+        raise ValueError("height and width must be positive")
+    if height * width > _env_int("MY_AGENT3_MAX_REGION_CELLS", 400):
+        raise ValueError("requested region exceeds MY_AGENT3_MAX_REGION_CELLS")
+    end_row, end_col = row + height, col + width
+    if row < 0 or col < 0 or end_row > board.shape[0] or end_col > board.shape[1]:
+        raise ValueError(f"region [{row}:{end_row}, {col}:{end_col}] is outside board {board.shape}")
+    return board[row:end_row, col:end_col]
+
+
+def _region_view(board: np.ndarray, row: int, col: int, height: int, width: int) -> dict[str, Any]:
+    region = _region_array(board, row, col, height, width)
+    return {
+        "bbox": [row, col, row + height - 1, col + width - 1],
+        "shape": [height, width],
+        "ascii": _ascii(region),
+    }
+
+
+def _relative_pattern_mismatches(first: np.ndarray, second: np.ndarray) -> int:
+    """Compare equality structure while allowing a consistent colour remap."""
+    first_to_second: dict[int, int] = {}
+    second_to_first: dict[int, int] = {}
+    mismatches = 0
+    for left, right in zip(first.flat, second.flat):
+        left_id, right_id = int(left), int(right)
+        if (
+            left_id in first_to_second and first_to_second[left_id] != right_id
+        ) or (
+            right_id in second_to_first and second_to_first[right_id] != left_id
+        ):
+            mismatches += 1
+            continue
+        first_to_second[left_id] = right_id
+        second_to_first[right_id] = left_id
+    return mismatches
+
+
+def _compare_regions(
+    board: np.ndarray,
+    row1: int,
+    col1: int,
+    row2: int,
+    col2: int,
+    height: int,
+    width: int,
+    rotations: bool = True,
+    reflections: bool = True,
+) -> dict[str, Any]:
+    """Compare two crops under exact and colour-remapped pattern matching."""
+    first = _region_array(board, row1, col1, height, width)
+    second = _region_array(board, row2, col2, height, width)
+    variants: list[tuple[str, np.ndarray]] = [("identity", second)]
+    if rotations:
+        variants.extend((f"rotate_{degrees}", np.rot90(second, turns)) for turns, degrees in ((1, 90), (2, 180), (3, 270)))
+    if reflections:
+        variants.append(("flip_left_right", np.fliplr(second)))
+        variants.append(("flip_up_down", np.flipud(second)))
+    if rotations and reflections:
+        variants.extend(
+            (f"rotate_{degrees}_flip_left_right", np.fliplr(np.rot90(second, turns)))
+            for turns, degrees in ((1, 90), (2, 180), (3, 270))
+        )
+
+    exact_options: list[tuple[int, str]] = []
+    relative_options: list[tuple[int, str]] = []
+    for name, candidate in variants:
+        if candidate.shape != first.shape:
+            continue
+        exact_options.append((int(np.count_nonzero(first != candidate)), name))
+        relative_options.append((_relative_pattern_mismatches(first, candidate), name))
+    if not exact_options:
+        raise ValueError("no requested transform preserves the region dimensions")
+    exact_mismatches, exact_transform = min(exact_options)
+    relative_mismatches, relative_transform = min(relative_options)
+    cells = int(first.size)
+    return {
+        "first": _region_view(board, row1, col1, height, width),
+        "second": _region_view(board, row2, col2, height, width),
+        "exact": {
+            "best_transform": exact_transform,
+            "matching_cells": cells - exact_mismatches,
+            "mismatched_cells": exact_mismatches,
+            "equal": exact_mismatches == 0,
+        },
+        "relative_pattern": {
+            "best_transform": relative_transform,
+            "matching_cells": cells - relative_mismatches,
+            "mismatched_cells": relative_mismatches,
+            "equal": relative_mismatches == 0,
+            "meaning": "same equality pattern with a consistent colour remap",
+        },
+    }
+
+
+def _compact_transition_result(result: dict[str, Any]) -> dict[str, Any]:
+    """Keep a fresh turn informative without replaying verbose tool output."""
+    summary = result.get("change_summary") or {}
+    cells = summary.get("cells") or {}
+    return {
+        key: result.get(key)
+        for key in (
+            "action", "board_changed", "level_completed", "game_over", "done",
+            "valid_actions", "actions_taken",
+        )
+    } | {
+        "change": {
+            "cells": {key: cells[key] for key in ("count", "bbox", "color_changes") if key in cells},
+            "moved_components": [
+                {
+                    key: component[key]
+                    for key in (
+                        "color", "pixels", "hash", "before_bbox", "after_bbox", "row_delta", "col_delta",
+                    )
+                    if key in component
+                }
+                for component in summary.get("moved_components", [])
+            ],
+            "appeared_count": len(summary.get("appeared_components", [])),
+            "disappeared_count": len(summary.get("disappeared_components", [])),
+            "tracking_truncated": summary.get("tracking_truncated", False),
+        },
+    }
+
+
+def _repair_trailing_tool_artifact(code: str) -> str | None:
+    """Repair only the recurring unmatched ``},`` suffix emitted by some servers."""
+    stripped = code.rstrip()
+    for suffix in ("},", "}"):
+        if not stripped.endswith(suffix):
+            continue
+        repaired = stripped[: -len(suffix)].rstrip()
+        if repaired.endswith(")"):
+            return repaired
+    return None
+
+
+
+
+def _motion_member_key(component: dict[str, Any]) -> tuple[str, int, str]:
+    """Stable-enough identifier for a shape-preserving translated component."""
+    return (
+        str(component["color"]),
+        int(component["pixels"]),
+        str(component.get("hash", "")),
+    )
+
+
+def _motion_member_brief(member: tuple[str, int, str]) -> dict[str, Any]:
+    color, pixels, shape_hash = member
+    return {"color": color, "pixels": pixels, "hash": shape_hash}
+
+
+@dataclass
+class MotionHypothesisTracker:
+    """Accumulate conservative, action-dependent translation hypotheses.
+
+    Component ids belong to one segmentation only, so they cannot be used as
+    tracks.  Instead we use the existing exact colour/shape/pixel match from a
+    transition summary.  This intentionally excludes components that merely
+    grow, shrink, appear, or disappear (for example, a progress indicator).
+    """
+
+    max_candidates: int = field(
+        default_factory=lambda: _env_int("MY_AGENT3_MAX_MOTION_HYPOTHESES", 64)
+    )
+    action_trials: Counter[str] = field(default_factory=Counter)
+    candidates: dict[tuple[tuple[str, int, str], ...], Counter[tuple[str, int, int]]] = field(
+        default_factory=dict
+    )
+    non_translation_effects: dict[tuple[tuple[str, int, str], ...], Counter[str]] = field(
+        default_factory=dict
+    )
+    non_translation_examples: dict[
+        tuple[tuple[str, int, str], ...], dict[str, list[dict[str, Any]]]
+    ] = field(default_factory=dict)
+
+    def observe(
+        self,
+        action: str,
+        transition: dict[str, Any],
+        before_segmentation: dict[str, Any],
+    ) -> None:
+        """Record every exact translation and the co-moving groups it implies."""
+        self.action_trials[action] += 1
+        if transition.get("tracking_truncated"):
+            return
+
+        groups: dict[tuple[int, int], list[dict[str, Any]]] = defaultdict(list)
+        for component in transition.get("moved_components", []):
+            row_delta = component.get("row_delta")
+            col_delta = component.get("col_delta")
+            if not isinstance(row_delta, int) or not isinstance(col_delta, int):
+                continue
+            if not (row_delta or col_delta):
+                continue
+            groups[(row_delta, col_delta)].append(component)
+
+        moved_members = {
+            _motion_member_key(component)
+            for components in groups.values()
+            for component in components
+        }
+        visible_nodes: dict[tuple[str, int, str], list[dict[str, Any]]] = defaultdict(list)
+        for node in before_segmentation["nodes"]:
+            visible_nodes[_motion_member_key(node)].append(node)
+
+        # A learned candidate that is visible before an action but does not
+        # translate afterwards is valuable route evidence.  It may mean a wall,
+        # a boundary, or a conditional control, so do not overstate it as a
+        # definite collision.  This is deliberately evaluated before adding
+        # candidates from the current action.
+        for members in self.candidates:
+            if not all(visible_nodes.get(member) for member in members):
+                continue
+            if any(member in moved_members for member in members):
+                continue
+            effects = self.non_translation_effects.setdefault(members, Counter())
+            effects[action] += 1
+            examples = self.non_translation_examples.setdefault(members, {})
+            examples[action] = [
+                {
+                    "color": node["color"],
+                    "pixels": node["pixels"],
+                    "bbox": node["bbox"],
+                }
+                for member in members
+                for node in visible_nodes[member][:1]
+            ]
+
+        # Store both each part and a group when several parts move together.
+        # A group can represent a multicolour player without assuming that one
+        # particular colour is the entity's "real" identity.
+        for (row_delta, col_delta), components in groups.items():
+            member_groups = [
+                (member,)
+                for member in (_motion_member_key(component) for component in components)
+            ]
+            if len(components) > 1:
+                member_groups.append(tuple(sorted(_motion_member_key(component) for component in components)))
+            for members in member_groups:
+                if members not in self.candidates and len(self.candidates) >= self.max_candidates:
+                    continue
+                effects = self.candidates.setdefault(members, Counter())
+                effects[(action, row_delta, col_delta)] += 1
+
+    def snapshot(self) -> dict[str, Any]:
+        """Return compact evidence, ranked without claiming certainty too early."""
+        candidates: list[dict[str, Any]] = []
+        for members, effects in self.candidates.items():
+            action_effects = []
+            total_support = 0
+            for action in sorted({action for action, _, _ in effects}):
+                options = [
+                    (count, row_delta, col_delta)
+                    for (effect_action, row_delta, col_delta), count in effects.items()
+                    if effect_action == action
+                ]
+                support, row_delta, col_delta = max(options)
+                total_support += support
+                trials = self.action_trials[action]
+                consistency = support / trials if trials else 0.0
+                # One observation is useful but not proof; repeated, consistent
+                # probes asymptotically approach 1.0.
+                confidence = consistency * support / (support + 1)
+                action_effects.append({
+                    "action": action,
+                    "row_delta": row_delta,
+                    "col_delta": col_delta,
+                    "observations": support,
+                    "action_trials": trials,
+                    "confidence": round(confidence, 2),
+                })
+            candidate_confidence = max(
+                (effect["confidence"] for effect in action_effects), default=0.0
+            )
+            member_label = "+".join(
+                f"{color}{pixels}:{shape_hash[:6]}"
+                for color, pixels, shape_hash in members
+            )
+            candidates.append({
+                "candidate_id": (
+                    f"group:{member_label}" if len(members) > 1 else f"component:{member_label}"
+                ),
+                "kind": "co_moving_group" if len(members) > 1 else "component",
+                "members": [_motion_member_brief(member) for member in members],
+                "translation_observations": total_support,
+                "confidence": candidate_confidence,
+                "action_effects": action_effects,
+                "non_translation_effects": [
+                    {
+                        "action": action,
+                        "observations": observations,
+                        "latest_member_bboxes": self.non_translation_examples
+                        .get(members, {})
+                        .get(action, []),
+                        "note": (
+                            "Candidate was visible but did not translate; this can indicate "
+                            "a wall, boundary, or conditional/non-movement action."
+                        ),
+                    }
+                    for action, observations in sorted(
+                        self.non_translation_effects.get(members, {}).items()
+                    )
+                ],
+            })
+
+        candidates.sort(
+            key=lambda candidate: (
+                candidate["confidence"],
+                candidate["translation_observations"],
+                len(candidate["members"]),
+            ),
+            reverse=True,
+        )
+        # A composite candidate conveys the same evidence as each of its
+        # individual members. Prefer it in the compact turn state so the model
+        # sees the player-like whole before its redundant parts.
+        selected: list[dict[str, Any]] = []
+        covered_members: set[tuple[str, int, str]] = set()
+        for candidate in candidates:
+            members = {
+                (member["color"], member["pixels"], member["hash"])
+                for member in candidate["members"]
+            }
+            if candidate["kind"] == "component" and members <= covered_members:
+                continue
+            selected.append(candidate)
+            if candidate["kind"] == "co_moving_group":
+                covered_members.update(members)
+            if len(selected) >= _env_int("MY_AGENT3_MOTION_HYPOTHESIS_SAMPLES", 8):
+                break
+        return {
+            "action_trials": dict(sorted(self.action_trials.items())),
+            "candidates": selected,
+            "note": (
+                "Only exact shape-preserving translations are candidates; "
+                "in-place transformations are deliberately excluded."
+            ),
+        }
+
+
 @dataclass
 class FrameView:
     ascii: str
@@ -282,6 +740,16 @@ class FrameView:
     shape: tuple[int, int]
     step: int | None
     level: int | None
+
+    def __repr__(self) -> str:
+        # The default dataclass repr includes the entire ASCII grid and
+        # segmentation. Models occasionally print the object while orienting;
+        # keep that harmless without hiding the raw grid from explicit access.
+        return (
+            f"FrameView(shape={self.shape}, level={self.level}, step={self.step}, "
+            f"component_count={len(self.segmentation['nodes'])}; "
+            "use .ascii, view_region(), or .segmentation for details)"
+        )
 
 
 @dataclass
@@ -313,6 +781,7 @@ class PythonToolRuntime:
         self.max_actions = max_actions
         self.actions_taken = 0
         self.history: list[TransitionView] = []
+        self.motion_hypotheses = MotionHypothesisTracker()
         self.previous_frame: FrameView | None = None
         self.current_frame = self._frame_view()
         self.last_action: str | None = None
@@ -320,9 +789,10 @@ class PythonToolRuntime:
         self.last_error: str | None = None
         self.logger.board("initial_board", self.current_frame)
 
-    def _frame_view(self) -> FrameView:
+    def _frame_view(self, board: np.ndarray | None = None) -> FrameView:
         state = self.game.current_state
-        board = _board_from_state(state)
+        if board is None:
+            board = _board_from_state(state)
         raw = getattr(state, "raw", None)
         return FrameView(
             ascii=_ascii(board), segmentation=_components(board), shape=tuple(board.shape),
@@ -365,11 +835,53 @@ class PythonToolRuntime:
             raise ValueError("MOUSE requires both x and y (or row and col)")
         return action, params
 
+    def view_region(self, row: int, col: int, height: int, width: int) -> dict[str, Any]:
+        """Return a small coordinate-labelled crop for visual motif inspection."""
+        return _region_view(_board_from_state(self.game.current_state), row, col, height, width)
+
+    def view_component(self, component_id: int, padding: int = 1) -> dict[str, Any]:
+        """Return a bounded crop around one current-frame component."""
+        if isinstance(component_id, bool) or not isinstance(component_id, int):
+            raise TypeError("component_id must be an integer")
+        if isinstance(padding, bool) or not isinstance(padding, int) or padding < 0:
+            raise ValueError("padding must be a non-negative integer")
+        node = next(
+            (item for item in self.current_frame.segmentation["nodes"] if item["id"] == component_id),
+            None,
+        )
+        if node is None:
+            raise ValueError(f"component_id={component_id} is not in the current frame")
+        row1, col1, row2, col2 = node["bbox"]
+        board = _board_from_state(self.game.current_state)
+        top, left = max(0, row1 - padding), max(0, col1 - padding)
+        bottom, right = min(board.shape[0] - 1, row2 + padding), min(board.shape[1] - 1, col2 + padding)
+        return {"component": _component_brief(node), **_region_view(board, top, left, bottom - top + 1, right - left + 1)}
+
+    def compare_regions(
+        self,
+        row1: int,
+        col1: int,
+        row2: int,
+        col2: int,
+        height: int,
+        width: int,
+        rotations: bool = True,
+        reflections: bool = True,
+    ) -> dict[str, Any]:
+        """Compare same-sized visual motifs under rotation/reflection."""
+        return _compare_regions(
+            _board_from_state(self.game.current_state), row1, col1, row2, col2,
+            height, width, rotations, reflections,
+        )
+
     def action(self, requests: Any) -> list[dict[str, Any]]:
         """Execute one or more legal actions, returning compact transition metadata."""
         if not isinstance(requests, list):
             requests = [requests]
-        batch_cap = _env_int("MY_AGENT3_MAX_BATCH_ACTIONS", 8)
+        # Re-grounding after one move is much safer while discovering an
+        # unknown game.  A caller may explicitly raise this cap only after it
+        # has verified a reliable short sequence.
+        batch_cap = _env_int("MY_AGENT3_MAX_BATCH_ACTIONS", 1)
         if len(requests) > batch_cap:
             raise ValueError(f"A Python call may execute at most {batch_cap} actions")
         results = []
@@ -379,16 +891,24 @@ class PythonToolRuntime:
             if self.terminal():
                 break
             before = self.current_frame
+            before_board = _board_from_state(self.game.current_state).copy()
             action, data = self._parse_action(request)
             self.logger.record("action_requested", action=action.name, data=data)
             self.game.execute_action(arcengine.ActionInput(id=action, data=data))
             self.actions_taken += 1
             self.previous_frame = before
-            self.current_frame = self._frame_view()
+            after_board = _board_from_state(self.game.current_state)
+            self.current_frame = self._frame_view(after_board)
+            change_summary = _transition_summary(
+                before_board, after_board, before.segmentation, self.current_frame.segmentation,
+            )
+            self.motion_hypotheses.observe(action.name, change_summary, before.segmentation)
             raw = self.game.current_state.raw
             result = {
                 "action": action.name,
                 "board_changed": before.ascii != self.current_frame.ascii,
+                "change_summary": change_summary,
+                "motion_hypotheses": self.motion_hypotheses.snapshot(),
                 "level_completed": before.level != self.current_frame.level,
                 "game_over": getattr(raw, "state", None) == getattr(arcengine.GameState, "GAME_OVER", None),
                 "done": self.terminal(),
@@ -437,7 +957,8 @@ class PythonToolRuntime:
 
         safe_builtins = {
             "abs": abs, "all": all, "any": any, "bool": bool, "dict": dict,
-            "enumerate": enumerate, "filter": filter, "float": float, "frozenset": frozenset,
+            "dir": dir, "enumerate": enumerate, "filter": filter, "float": float,
+            "frozenset": frozenset, "getattr": getattr,
             "int": int, "len": len, "list": list, "map": map, "max": max, "min": min,
             "print": print, "range": range, "reversed": reversed, "round": round, "set": set,
             "sorted": sorted, "str": str, "sum": sum, "tuple": tuple, "zip": zip,
@@ -449,11 +970,18 @@ class PythonToolRuntime:
             "transitions": self.history, "last_transition": self.history[-1] if self.history else None,
             "last_action": self.last_action, "last_action_result": self.last_action_result,
             "valid_actions": self.valid_actions(),
+            "motion_hypotheses": self.motion_hypotheses.snapshot(),
+            "components": self.current_frame.segmentation["nodes"],
+            "view_region": self.view_region,
+            "view_component": self.view_component,
+            "compare_regions": self.compare_regions,
         }
+        action_results: list[dict[str, Any]] = []
 
         def action_wrapper(requests: Any) -> list[dict[str, Any]]:
             """Refresh global tool variables before Python continues after action()."""
             result = self.action(requests)
+            action_results.extend(result)
             namespace.update({
                 "current_frame": self.current_frame,
                 "previous_frame": self.previous_frame,
@@ -461,17 +989,28 @@ class PythonToolRuntime:
                 "last_action": self.last_action,
                 "last_action_result": self.last_action_result,
                 "valid_actions": self.valid_actions(),
+                "motion_hypotheses": self.motion_hypotheses.snapshot(),
+                "components": self.current_frame.segmentation["nodes"],
             })
             return result
 
         namespace["action"] = action_wrapper
         self.logger.record("python_script", code=code)
         try:
+            try:
+                compiled = compile(code, "<arc-python-tool>", "exec")
+            except SyntaxError:
+                repaired = _repair_trailing_tool_artifact(code)
+                if repaired is None:
+                    raise
+                compiled = compile(repaired, "<arc-python-tool>", "exec")
+                self.logger.record("python_code_repaired", original=code, repaired=repaired)
+                output.write("INFO repaired trailing tool-call artifact\n")
             with contextlib.redirect_stdout(output):
                 previous_trace = sys.gettrace()
                 sys.settrace(trace)
                 try:
-                    exec(compile(code, "<arc-python-tool>", "exec"), namespace, namespace)
+                    exec(compiled, namespace, namespace)
                 finally:
                     sys.settrace(previous_trace)
             if "result" in namespace:
@@ -481,6 +1020,14 @@ class PythonToolRuntime:
                 output.write(rendered)
         except Exception as exc:  # Tool errors are feedback for the model, not game failures.
             output.write(f"ERROR {type(exc).__name__}: {exc}")
+        # Models naturally write action([...]) as a statement.  Never make
+        # them infer that they must assign its return value just to receive the
+        # observation needed for their next decision.  Keep the feedback even
+        # if later code in the same tool call raises an exception.
+        if action_results:
+            if output.tell():
+                output.write("\n")
+            output.write(json.dumps({"action_feedback": action_results}, default=str))
         text = output.getvalue().strip()
         if len(text) > self.MAX_OUTPUT_CHARS:
             text = text[: self.MAX_OUTPUT_CHARS] + "\n[tool output truncated]"
@@ -496,17 +1043,43 @@ act. Do not return an action in prose: call action(...) inside Python.
 
 Each Python call begins with current_frame, previous_frame, history,
 transitions, last_transition, last_action, last_action_result, and valid_actions.
-current_frame has .ascii, .segmentation, .shape, .step, and .level.
+It also begins with motion_hypotheses: conservative action-to-translation
+evidence for individual components and co-moving groups. It intentionally
+excludes objects that only grow, shrink, appear, or disappear.
+current_frame has .ascii, .segmentation, .shape, .step, and .level; components
+is a shorthand for current_frame.segmentation['nodes']. Use whichever board
+representation fits the question. Avoid repeatedly dumping a whole board when a
+targeted ASCII slice or helper result will answer it.
 segmentation is {'nodes': [...], 'adjacency_list': [...]}; node ids are local to
 the current frame. Use compact summaries rather than printing whole boards.
+Optional visual helpers are view_region(row, col, height, width),
+view_component(component_id, padding=1), and compare_regions(row1, col1, row2,
+col2, height, width). compare_regions tests exact and colour-remapped pattern
+matches, including rotations/reflections by default. Before calling an object a
+goal, inspect its local pattern and either compare it with a related motif or
+obtain an action outcome that supports the claim. Do not infer a goal from an
+icon's colour or bounding box alone.
 
 action accepts a list such as action(['ACTION1']) or
 action([{'action': 'MOUSE', 'row': 4, 'col': 7}]). It validates actions against
 valid_actions, executes them immediately, and refreshes every state variable.
-You may call action multiple times or use a short, reliable batch. Stop acting
-when a result says done, game_over, or level_completed; re-ground on the next
-turn. Explore with discriminating probes, then write BFS/search code when the
-mechanism is understood. A game need not have a moving player.
+Every action call automatically returns action_feedback, even if your Python
+code does not assign or print its return value. action_feedback.change_summary
+reports changed cells and conservatively matched moved components with explicit
+row_delta (negative=up) and col_delta (negative=left). Use that feedback first;
+use motion_hypotheses to reuse verified action effects, but treat low-confidence
+or single-observation candidates as hypotheses to test rather than facts. Its
+non_translation_effects identify when a visible candidate did not move, which
+can indicate a wall, boundary, or conditional action; inspect that local area
+before repeating the same move.
+Do not repeatedly print a full board once the relevant evidence is known.
+Make one discriminating probe at a time, then re-ground on the next turn. A
+single action per Python call is the default; do not request a batch while
+discovering movement or obstacles.
+Keep reasoning concise and call python promptly. Do not restate the action map
+or speculate about a target when the next discriminating inspection is clear.
+Explore before writing BFS/search code when the mechanism is understood. A game
+need not have a moving player.
 """
 
 
@@ -531,6 +1104,7 @@ class PythonToolAgent:
         self.messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
         self.max_messages = _env_int("MY_AGENT3_MESSAGE_LIMIT", 18, 6)
         self.max_tool_calls = _env_int("MY_AGENT3_TOOL_CALLS_PER_TURN", 6)
+        self.max_tokens = _env_int("MY_AGENT3_MAX_TOKENS", 2048)
         self.forced_tool_choice_supported = True
 
     def _evict(self) -> None:
@@ -538,13 +1112,25 @@ class PythonToolAgent:
         if len(self.messages) > self.max_messages:
             self.messages = [self.messages[0], *self.messages[-(self.max_messages - 1):]]
 
+    def _reset_for_reground(self, reason: str = "action") -> None:
+        """Discard stale tool transcripts; the next state carries durable evidence."""
+        discarded = max(0, len(self.messages) - 1)
+        self.messages = [self.messages[0]]
+        self.runtime.logger.record("context_regrounded", reason=reason, discarded_messages=discarded)
+
+    def reset_after_inspection(self) -> None:
+        """Start an explicit retry without carrying a spent inspection transcript."""
+        self._reset_for_reground(reason="inspection_retry")
+
     def _turn_message(self) -> dict[str, Any]:
         frame = self.runtime.current_frame
         summary = {
             "shape": frame.shape, "level": frame.level, "step": frame.step,
             "valid_actions": self.runtime.valid_actions(),
             "last_action": self.runtime.last_action,
-            "last_action_result": self.runtime.last_action_result,
+            "last_transition": _compact_transition_result(self.runtime.last_action_result)
+            if self.runtime.last_action_result else None,
+            "motion_hypotheses": self.runtime.motion_hypotheses.snapshot(),
             "last_error": self.runtime.last_error,
             "components": [
                 {key: node[key] for key in ("id", "color", "pixels", "bbox", "hash", "children")}
@@ -561,18 +1147,29 @@ class PythonToolAgent:
         self.client.close()
 
     def preflight(self) -> bool:
-        """Verify the exact multimodal, required-tool request before playing."""
+        """Verify the multimodal tool protocol without changing game state."""
         timeout = _env_float("MY_AGENT3_PREFLIGHT_TIMEOUT", 45.0, 1.0)
-        messages = [self.messages[0], self._turn_message()]
+        max_tokens = _env_int("MY_AGENT3_PREFLIGHT_MAX_TOKENS", self.max_tokens)
+        messages = [
+            self.messages[0],
+            self._turn_message(),
+            {
+                "role": "user",
+                "content": (
+                    "Preflight check: call the python tool now with exactly "
+                    "print('preflight-ok'). Do not analyze the board or call action()."
+                ),
+            },
+        ]
         started = time.monotonic()
         self.runtime.logger.record(
-            "model_preflight_request", model=self.model, timeout_s=timeout,
+            "model_preflight_request", model=self.model, timeout_s=timeout, max_tokens=max_tokens,
             valid_actions=self.runtime.valid_actions(),
         )
         try:
             response = self.client.chat.completions.create(
                 model=self.model, messages=messages, tools=[PYTHON_TOOL], tool_choice="required",
-                temperature=0, max_tokens=256, timeout=timeout,
+                temperature=0, max_tokens=max_tokens, timeout=timeout,
                 extra_body={"chat_template_kwargs": {"enable_thinking": True}},
             )
         except Exception as exc:
@@ -584,8 +1181,15 @@ class PythonToolAgent:
             return False
 
         choices = list(getattr(response, "choices", []) or [])
-        message = choices[0].message if choices else None
+        choice = choices[0] if choices else None
+        message = choice.message if choice else None
         calls = list(getattr(message, "tool_calls", None) or [])
+        usage = getattr(response, "usage", None)
+        completion_tokens = getattr(usage, "completion_tokens", None)
+        finish_reason = getattr(choice, "finish_reason", None)
+        truncated = finish_reason in {"length", "max_tokens"} or (
+            isinstance(completion_tokens, int) and completion_tokens >= max_tokens
+        )
         valid_call = False
         for call in calls:
             if call.function.name != "python":
@@ -600,12 +1204,31 @@ class PythonToolAgent:
         self.runtime.logger.record(
             "model_preflight_response", duration_s=round(time.monotonic() - started, 3),
             valid_tool_call=valid_call,
+            truncated=truncated,
+            finish_reason=finish_reason,
+            content=getattr(message, "content", None),
+            reasoning=(
+                getattr(message, "reasoning", None)
+                or getattr(message, "reasoning_content", None)
+            ),
             tool_calls=[call.model_dump() for call in calls],
-            usage=response.usage.model_dump() if response.usage else None,
+            tool_arguments=[call.function.arguments for call in calls],
+            usage=usage.model_dump() if usage else None,
         )
         if not valid_call:
-            self.runtime.last_error = "preflight did not return a valid python tool call"
-            self.runtime.logger.record("model_preflight_error", error=self.runtime.last_error)
+            if truncated:
+                self.runtime.last_error = (
+                    f"preflight_truncated: response reached the {max_tokens}-token limit "
+                    "before a valid python tool call"
+                )
+                failure_kind = "preflight_truncated"
+            else:
+                self.runtime.last_error = "preflight did not return a valid python tool call"
+                failure_kind = "invalid_tool_call"
+            self.runtime.logger.record(
+                "model_preflight_error", error=self.runtime.last_error,
+                failure_kind=failure_kind, finish_reason=finish_reason,
+            )
         return valid_call
 
     def play_turn(self) -> bool:
@@ -627,7 +1250,7 @@ class PythonToolAgent:
                 response = self.client.chat.completions.create(
                     model=self.model, messages=self.messages, tools=[PYTHON_TOOL],
                     tool_choice="required" if self.forced_tool_choice_supported else "auto",
-                    temperature=0, max_tokens=2048,
+                    temperature=0, max_tokens=self.max_tokens,
                     extra_body={"chat_template_kwargs": {"enable_thinking": True}},
                 )
             except BadRequestError as exc:
@@ -674,8 +1297,17 @@ class PythonToolAgent:
             if not calls:
                 self.messages.append({"role": "user", "content": "Call the python tool now; do not answer in prose."})
                 continue
+            action_executed = False
             for call in calls:
-                if call.function.name != "python":
+                if action_executed:
+                    # vLLM may emit several tool calls in one response.  Leave
+                    # their game-changing work for a fresh, fully grounded turn
+                    # while still satisfying the response protocol for each id.
+                    result = json.dumps({
+                        "deferred": True,
+                        "reason": "An earlier tool call changed the game state; re-grounding now.",
+                    })
+                elif call.function.name != "python":
                     result = json.dumps({"error": "python is the only available tool"})
                 else:
                     try:
@@ -691,6 +1323,11 @@ class PythonToolAgent:
                 ):
                     self._evict()
                     return self.runtime.actions_taken > before
+                if self.runtime.actions_taken > before:
+                    action_executed = True
+            if action_executed:
+                self._reset_for_reground()
+                return True
             self._evict()
         return self.runtime.actions_taken > before
 
@@ -700,7 +1337,7 @@ class MyAgent3Solver(Solver):
     """TAAF entry point. Set the Kaggle solver to ``MyAgent3Solver``."""
 
     label: str = "MyAgent3"
-    max_actions_per_game: int = 10
+    max_actions_per_game: int = 100
     _preflight_ok: bool | None = field(default=None, init=False, repr=False)
 
     async def _run_games(self, games: list[taaf.game.Game]) -> None:
@@ -719,6 +1356,8 @@ class MyAgent3Solver(Solver):
             if not self._preflight_ok:
                 logger.record("solver_stopped", reason="model_preflight_failed", error=runtime.last_error)
                 return
+            max_no_action_retries = _env_int("MY_AGENT3_MAX_NO_ACTION_RETRIES", 2)
+            no_action_retries = 0
             while not runtime.terminal() and runtime.actions_taken < self.max_actions_per_game:
                 await asyncio.sleep(0)
                 if runtime.game_over():
@@ -728,13 +1367,26 @@ class MyAgent3Solver(Solver):
                     continue
                 did_act = agent.play_turn()
                 if did_act:
+                    no_action_retries = 0
                     continue
-                # Never guess an action after an inference failure.  In
-                # particular, MOUSE is legal in some games but requires x/y;
-                # an unparameterized fallback previously crashed those games.
+                if runtime.last_error:
+                    logger.record(
+                        "solver_stopped", reason="model_error", error=runtime.last_error,
+                        actions_taken=runtime.actions_taken,
+                    )
+                    break
+                if no_action_retries < max_no_action_retries:
+                    no_action_retries += 1
+                    logger.record(
+                        "solver_retrying", reason="inspection_only_turn",
+                        retry=no_action_retries, max_retries=max_no_action_retries,
+                        actions_taken=runtime.actions_taken,
+                    )
+                    agent.reset_after_inspection()
+                    continue
                 logger.record(
-                    "solver_stopped", reason="model_did_not_act", error=runtime.last_error,
-                    actions_taken=runtime.actions_taken,
+                    "solver_stopped", reason="inspection_retry_exhausted",
+                    actions_taken=runtime.actions_taken, retries=no_action_retries,
                 )
                 break
             if game.game_run is not None and game.game_run.final_score is None:

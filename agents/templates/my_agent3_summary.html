@@ -51,11 +51,31 @@
 
   <h2>Main classes and responsibilities</h2>
   <div class="grid">
-    <section class="card"><h3><code>PythonToolRuntime</code></h3><p>Maintains the live game bridge: frame views, prior frame, transitions, action count, valid-action checks, reset state, and execution of model-requested actions.</p></section>
+    <section class="card"><h3><code>PythonToolRuntime</code></h3><p>Maintains the live game bridge: frame views, prior frame, transitions, motion hypotheses, action count, valid-action checks, reset state, and execution of model-requested actions.</p></section>
     <section class="card"><h3><code>PythonToolAgent</code></h3><p>Owns the OpenAI-compatible client and conversation. It sends the current board to the model, handles Python function calls, trims old context, and records endpoint errors.</p></section>
     <section class="card"><h3><code>MyAgent3Solver</code></h3><p>TAAF entry point. Runs a game to completion, automatically resets after game-over, enforces the game action limit, and finishes runs safely on cancellation or error.</p></section>
     <section class="card"><h3>Frame data types</h3><p><code>FrameView</code> is the model-facing snapshot. <code>TransitionView</code> preserves action, before frame, after frame, and compact result metadata.</p></section>
   </div>
+
+  <h2>Updates from earlier <code>my_agent3.py</code> versions</h2>
+  <p>The current version keeps the same Python-tool design, but strengthens observability, reliability, and performance compared with the first <code>my_agent3.py</code> release.</p>
+  <table>
+    <thead><tr><th>Area</th><th>Update</th><th>Why it matters</th></tr></thead>
+    <tbody>
+      <tr><td>Run diagnostics</td><td>Added per-game JSONL logging for lifecycle events, boards, model requests and responses, generated Python, tool output, action requests/results, and endpoint failures. Model-call durations are now recorded too.</td><td>Failed or truncated notebook runs can be replayed and diagnosed from a chronological record.</td></tr>
+      <tr><td>Logging defaults</td><td>Development runs now create logs automatically in <code>my_agent3_logs</code> (or <code>/kaggle/working/my_agent3_logs</code>). Competition reruns remain quiet by default; <code>MY_AGENT3_LOG_DIR</code> overrides either behavior, and an empty value disables logging.</td><td>Local experimentation is observable without adding setup, while submission runs avoid unnecessary files.</td></tr>
+      <tr><td>Model preflight</td><td>Before the first game, the solver sends the real image and tool schema with a harmless <code>print('preflight-ok')</code> request. It uses the ordinary token budget and records response content, reasoning, finish reason, raw arguments, and truncation.</td><td>An incompatible endpoint or a response truncated before its tool call stops safely before the agent makes game moves.</td></tr>
+      <tr><td>Failure behavior</td><td>When inference fails or the model does not act, the solver records <code>solver_stopped</code> and ends that game instead of issuing a guessed fallback action. Coordinate-based <code>MOUSE</code> actions now require both coordinates.</td><td>Prevents accidental, malformed, or ungrounded actions after a model failure.</td></tr>
+      <tr><td>Action feedback</td><td>Every <code>action(...)</code> call automatically returns compact JSON feedback, even when model code uses it as a statement rather than assigning <code>result</code>. A known trailing unmatched <code>},</code> artifact is repaired only after its original code fails to compile.</td><td>The next decision sees the real action outcome without relying on incidental stdout, and a recurring server formatting artifact does not consume a turn.</td></tr>
+      <tr><td>Transition summary</td><td>Action feedback includes changed-cell bounds, colour changes, conservative shape/colour component matches, row/column movement deltas, and appeared/disappeared components.</td><td>The model can distinguish a player-like moved object from UI changes without printing a full grid. Negative row delta means up; negative column delta means left.</td></tr>
+      <tr><td>Motion hypotheses</td><td>The runtime aggregates exact shape-preserving translations by action, records co-moving groups, and retains the latest location when a visible candidate fails to translate. It reports evidence counts, action trials, and deliberately cautious confidence.</td><td>It can surface a composite controlled-entity candidate, distinguish a likely wall/boundary from an unknown control, and avoid mistaking in-place UI/progress-bar changes for movement.</td></tr>
+      <tr><td>Motif inspection</td><td>The Python tool supplies bounded <code>view_region</code>, <code>view_component</code>, and rotation/reflection-aware <code>compare_regions</code> helpers. Comparisons include exact and consistent-colour-remapped pattern scores.</td><td>Small UI/reference patterns can be tested rather than guessed from a full-board image.</td></tr>
+      <tr><td>State re-grounding and retries</td><td>After a tool call changes game state, further calls from the same model response are deferred and old assistant/tool transcripts are discarded. An inspection-only outer turn gets up to <code>MY_AGENT3_MAX_NO_ACTION_RETRIES</code> fresh attempts (default 2); endpoint errors still stop immediately.</td><td>Prevents stale context and transcript growth from crowding out the current board without abandoning a game after one spent inspection turn.</td></tr>
+      <tr><td>Component extraction</td><td>Segmentation now labels the board once, derives adjacency by scanning neighbouring labels, avoids sorting component pixels for hashes, and skips quadratic containment analysis above <code>MY_AGENT3_MAX_CONTAINMENT_NODES</code> (default 128).</td><td>Board summaries remain responsive on highly fragmented boards.</td></tr>
+      <tr><td>Resource accounting</td><td>The Python instruction counter now traces only model-written tool code, not ARC Engine internals. The OpenAI client is also explicitly closed at the end of each game.</td><td>Valid actions no longer consume the tool-code budget through engine work, and client resources are released predictably.</td></tr>
+      <tr><td>Conservative defaults</td><td>One action per Python call remains the default (<code>MY_AGENT3_MAX_BATCH_ACTIONS=1</code>); the per-game cap is configurable and currently defaults to 100.</td><td>Preserves fresh visual grounding while allowing longer runs when the notebook budget permits.</td></tr>
+    </tbody>
+  </table>
 
   <h2>Per-game execution flow</h2>
   <div class="diagram"><div class="flow" style="min-width:940px">
@@ -69,7 +89,7 @@
     <li><code>MyAgent3Solver._play_one</code> constructs <code>PythonToolRuntime(game, max_actions)</code> and its matching <code>PythonToolAgent</code>.</li>
     <li>The agent sends the model a compact state summary plus an 8× nearest-neighbour board image.</li>
     <li>The model receives only one function: <code>python(code: str)</code>.</li>
-    <li>The runtime executes the code with current variables injected. Code can make zero, one, or a short batch of real actions.</li>
+    <li>The runtime executes the code with current variables injected. Code can make zero or one real action by default; a caller may explicitly raise the batch cap only for verified routes.</li>
     <li>Every real action refreshes <code>current_frame</code>, <code>previous_frame</code>, <code>history</code>, <code>valid_actions</code>, and <code>last_action_result</code>.</li>
     <li>On an engine game-over, the solver performs a legal <code>RESET</code>; on win, stopped run, or action cap, it finalizes the TAAF game.</li>
   </ol>
@@ -79,19 +99,24 @@
   <table>
     <thead><tr><th>Variable</th><th>Meaning</th></tr></thead>
     <tbody>
-      <tr><td><code>current_frame</code></td><td>Latest <code>FrameView</code>: <code>.ascii</code>, <code>.segmentation</code>, <code>.shape</code>, <code>.step</code>, and <code>.level</code>.</td></tr>
+      <tr><td><code>current_frame</code></td><td>Latest <code>FrameView</code>: <code>.ascii</code>, <code>.segmentation</code>, <code>.shape</code>, <code>.step</code>, and <code>.level</code>. Use the representation that best fits the current question.</td></tr>
       <tr><td><code>previous_frame</code></td><td>State immediately before the most recent real action, or <code>None</code> before the first action.</td></tr>
       <tr><td><code>history</code> / <code>transitions</code></td><td>Chronological <code>TransitionView</code> values with <code>.action</code>, <code>.before_frame</code>, <code>.after_frame</code>, <code>.frame</code>, and <code>.result</code>.</td></tr>
       <tr><td><code>last_transition</code></td><td>The latest transition or <code>None</code>.</td></tr>
       <tr><td><code>valid_actions</code></td><td>The current action names that the engine permits. The runtime rejects any other action.</td></tr>
+      <tr><td><code>components</code></td><td>Shorthand for <code>current_frame.segmentation["nodes"]</code>.</td></tr>
       <tr><td><code>last_action_result</code></td><td>Compact fields including <code>board_changed</code>, <code>level_completed</code>, <code>game_over</code>, <code>done</code>, and <code>actions_taken</code>.</td></tr>
+      <tr><td><code>motion_hypotheses</code></td><td>Snapshot of translation-only component and co-moving-group candidates. Each action effect carries its observed displacement, supporting observations, total action trials, and confidence; non-translation effects retain the latest candidate location.</td></tr>
+      <tr><td><code>view_region(row, col, height, width)</code></td><td>Returns a validated, bounded coordinate crop as ASCII.</td></tr>
+      <tr><td><code>view_component(component_id, padding=1)</code></td><td>Returns a bounded crop around the selected current-frame component.</td></tr>
+      <tr><td><code>compare_regions(row1, col1, row2, col2, height, width)</code></td><td>Compares two same-sized crops under rotations/reflections, reporting exact and colour-remapped pattern matches.</td></tr>
       <tr><td><code>action(...)</code></td><td>The sole bridge back to the game engine. It executes validated action requests and immediately refreshes all state values.</td></tr>
     </tbody>
   </table>
 
   <h2>Board representation</h2>
   <div class="grid">
-    <section class="card"><h3>ASCII grid</h3><p><code>current_frame.ascii</code> uses symbols <code>0–9</code> and <code>A–F</code> for ARC colours. It is available for precise local checks.</p></section>
+    <section class="card"><h3>ASCII grid</h3><p><code>current_frame.ascii</code> uses symbols <code>0–9</code> and <code>A–F</code> for ARC colours. It is available for direct textual analysis; <code>view_region</code> and <code>view_component</code> remain optional crop helpers.</p></section>
     <section class="card"><h3>Segmentation</h3><p><code>current_frame.segmentation</code> contains 4-connected same-colour components, hashes, pixel counts, bounding boxes, boundaries, containment children, and edge adjacency.</p></section>
     <section class="card"><h3>Visual image</h3><p>The chat turn also carries an upscaled, nearest-neighbour PNG, so vision-capable models can use shape and layout information directly.</p></section>
   </div>
@@ -101,12 +126,9 @@ small = [(n["id"], n["color"], n["bbox"]) for n in nodes if n["pixels"] &lt;= 8]
 result = {"small_components": small, "actions": valid_actions}</pre>
 
   <h2>How model code takes actions</h2>
-  <p>The action API accepts a single action or a list. A list is capped so the model cannot accidentally run an unbounded plan. The model should use a single discriminating probe while uncertain, then use a short sequence only after it has verified the mechanic.</p>
+  <p>The action API accepts a single action or a list. The default list cap is one action (<code>MY_AGENT3_MAX_BATCH_ACTIONS=1</code>), which forces fresh visual grounding while a mechanism or obstacle is unknown. Raise it explicitly only for a verified route. Each action automatically returns <code>action_feedback</code> with a compact <code>change_summary</code>; no <code>result = action(...)</code> assignment is necessary.</p>
   <pre># Simple actions
 action(["ACTION1"])
-
-# A short, already-verified route
-action(["ACTION1", "ACTION1", "ACTION4"])
 
 # Coordinate action. Duck-style row/col is converted to ARC Engine x/y.
 action([{"action": "MOUSE", "row": 12, "col": 31}])</pre>
@@ -121,8 +143,9 @@ action([{"action": "MOUSE", "row": 12, "col": 31}])</pre>
       <tr><td>Code size</td><td>Rejects code longer than 16,000 characters.</td></tr>
       <tr><td>Instruction budget</td><td>A trace counter stops Python after 20,000 executed line events.</td></tr>
       <tr><td>Tool output</td><td>Truncates output at 6,000 characters to keep the conversation useful.</td></tr>
-      <tr><td>Action batch</td><td><code>MY_AGENT3_MAX_BATCH_ACTIONS</code>, default 8, limits real actions from one tool execution.</td></tr>
+      <tr><td>Action batch</td><td><code>MY_AGENT3_MAX_BATCH_ACTIONS</code>, default 1, limits real actions from one tool execution. Raise it only for verified routes.</td></tr>
       <tr><td>Per-game actions</td><td><code>max_actions_per_game</code>, default 100, bounds the entire run.</td></tr>
+      <tr><td>Inspection-only retry</td><td><code>MY_AGENT3_MAX_NO_ACTION_RETRIES</code>, default 2, retries a turn that used its tool calls without acting, with a fresh context.</td></tr>
     </tbody>
   </table>
   <div class="callout warn"><strong>Deployment note:</strong> do not expose this in-process tool to untrusted users or arbitrary remote prompts. For a hostile-code threat model, execute the Python tool in an OS/container sandbox with resource limits.</div>
@@ -130,16 +153,16 @@ action([{"action": "MOUSE", "row": 12, "col": 31}])</pre>
   <h2>Conversation and endpoint behavior</h2>
   <div class="diagram"><div class="flow" style="min-width:850px">
     <div class="node">System prompt<small>Exploration, search, and action rules</small></div><div class="arrow">→</div>
-    <div class="node model">Recent messages<small>Bounded by message eviction</small></div><div class="arrow">→</div>
+    <div class="node model">Fresh state context<small>Old transcript cleared after action or spent inspection</small></div><div class="arrow">→</div>
     <div class="node tool">Tool result<small>Compact stdout/result/action metadata</small></div><div class="arrow">↺</div>
     <div class="node">Next decision<small>Updated board and transition history</small></div>
   </div></div>
-  <p><code>PythonToolAgent</code> retains the system prompt and recent messages, evicting older context once <code>MY_AGENT3_MESSAGE_LIMIT</code> is exceeded (default 18). It allows up to <code>MY_AGENT3_TOOL_CALLS_PER_TURN</code> model calls per outer turn (default 6).</p>
+  <p><code>PythonToolAgent</code> keeps recent messages while inspecting a fixed state, but returns to the system prompt after each real action. If an outer turn spends its tool-call allowance without an action, the solver re-grounds and retries up to <code>MY_AGENT3_MAX_NO_ACTION_RETRIES</code> times (default 2). The next state supplies compact durable transition and motion evidence, avoiding repeated large tool outputs. It retains a bounded-message fallback via <code>MY_AGENT3_MESSAGE_LIMIT</code> (default 18) and allows up to <code>MY_AGENT3_TOOL_CALLS_PER_TURN</code> model calls per outer turn (default 6).</p>
   <p>The OpenAI client talks to <code>LOCAL_ANALYZER_BASE_URL</code> or <code>OPENAI_BASE_URL</code>, defaulting to <code>http://127.0.0.1:1234/v1</code>. The model comes from <code>INFERENCE_ANALYZER_MODEL</code> or <code>LOCAL_ANALYZER_MODEL_ID</code>. Connect, read, write, and pool timeouts have dedicated <code>MY_AGENT3_…_TIMEOUT</code> variables.</p>
-  <p>If a local server rejects forced tool choice, the agent retries using automatic tool choice. If inference fails or the model never acts, the solver makes one legal non-reset fallback probe rather than silently ending the game.</p>
+  <p>If a local server rejects forced tool choice, the agent retries using automatic tool choice. Endpoint errors stop the game immediately; an inspection-only turn is instead retried as described above. When those retries are exhausted, the solver records the failure rather than guessing an action.</p>
 
   <h2>Optional run logs</h2>
-  <p>Logging is off by default. Set <code>MY_AGENT3_LOG_DIR</code> to write one JSONL file per game. This is useful on Kaggle because it preserves the exact chronology of model calls, generated Python, tool output, actions, and state transitions even when the notebook output is truncated.</p>
+  <p>Outside competition reruns, logging is on by default: it writes one JSONL file per game to <code>my_agent3_logs</code>, or to <code>/kaggle/working/my_agent3_logs</code> when that directory exists. During a submission rerun (<code>TAAF_RUN_AS_SUBMISSION</code>), logging is off unless <code>MY_AGENT3_LOG_DIR</code> is set. Set <code>MY_AGENT3_LOG_DIR</code> to choose a location; set it to an empty value to disable logging explicitly. Logs preserve the chronology of model calls, generated Python, tool output, actions, and state transitions even when notebook output is truncated.</p>
   <pre>export MY_AGENT3_LOG_DIR=/kaggle/working/my_agent3_logs
 export MY_AGENT3_LOG_BOARDS=1       # include ASCII grids and segmentation
 export MY_AGENT3_LOG_STDOUT=1       # also mirror compact events to notebook stdout</pre>
@@ -150,7 +173,7 @@ export MY_AGENT3_LOG_STDOUT=1       # also mirror compact events to notebook std
       <tr><td><code>initial_board</code> / <code>board_after_action</code></td><td>Shape, level, step, component count; with <code>MY_AGENT3_LOG_BOARDS=1</code>, full ASCII board and segmentation.</td></tr>
       <tr><td><code>model_request</code></td><td>Selected model, level, step, valid actions, and message count.</td></tr>
       <tr><td><code>model_response</code></td><td>Model text/reasoning, raw tool calls, and reported token usage.</td></tr>
-      <tr><td><code>python_script</code> / <code>python_result</code></td><td>The exact Python submitted by the model and its compact stdout/result.</td></tr>
+      <tr><td><code>python_script</code> / <code>python_code_repaired</code> / <code>python_result</code></td><td>The submitted Python, any narrowly scoped repaired trailing artifact, and compact stdout/result.</td></tr>
       <tr><td><code>action_requested</code> / <code>action_result</code></td><td>Validated action/data plus board-change, level-completion, game-over, done, and action-count metadata.</td></tr>
       <tr><td><code>model_error</code> / <code>tool_choice_fallback</code></td><td>Endpoint failure details or compatibility fallback activation.</td></tr>
     </tbody>
@@ -160,6 +183,7 @@ export MY_AGENT3_LOG_STDOUT=1       # also mirror compact events to notebook std
   <h2>Using the solver</h2>
   <pre>from agents.templates.my_agent3 import MyAgent3Solver
 
+# The default is 100 actions per game; lower it for short experimental runs.
 solver = MyAgent3Solver(max_actions_per_game=100)</pre>
   <p>For compatibility with an older Kaggle cell that imports <code>MyAgentSolver</code>, the file also exports <code>MyAgentSolver = MyAgent3Solver</code>.</p>
 
