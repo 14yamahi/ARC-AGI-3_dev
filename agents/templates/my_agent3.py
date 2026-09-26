@@ -764,6 +764,108 @@ class TransitionView:
         return self.after_frame
 
 
+@dataclass
+class ExplorationLedger:
+    """Record generic action coverage without selecting actions for the model."""
+
+    state_visits: Counter[str] = field(default_factory=Counter)
+    state_trials: dict[str, Counter[str]] = field(
+        default_factory=lambda: defaultdict(Counter)
+    )
+    level_trials: dict[str, Counter[str]] = field(
+        default_factory=lambda: defaultdict(Counter)
+    )
+    state_outcomes: dict[tuple[str, str], dict[str, Any]] = field(default_factory=dict)
+    level_outcomes: dict[tuple[str, str], dict[str, Any]] = field(default_factory=dict)
+
+    @staticmethod
+    def _state_id(frame: FrameView) -> str:
+        digest = hashlib.blake2b(frame.ascii.encode("utf-8"), digest_size=6).hexdigest()
+        return f"L{frame.level if frame.level is not None else '?'}:{digest}"
+
+    @staticmethod
+    def _level_id(frame: FrameView) -> str:
+        return str(frame.level) if frame.level is not None else "unknown"
+
+    @staticmethod
+    def _brief_effect(result: dict[str, Any]) -> dict[str, Any]:
+        summary = result.get("change_summary") or {}
+        cells = summary.get("cells") or {}
+        return {
+            "board_changed": bool(result.get("board_changed")),
+            "changed_cells": int(cells.get("count", 0)),
+            "moved": [
+                {
+                    key: component[key]
+                    for key in ("color", "pixels", "row_delta", "col_delta")
+                    if key in component
+                }
+                for component in summary.get("moved_components", [])[:2]
+            ],
+            "level_completed": bool(result.get("level_completed")),
+            "game_over": bool(result.get("game_over")),
+        }
+
+    def visit(self, frame: FrameView) -> None:
+        self.state_visits[self._state_id(frame)] += 1
+
+    def observe(
+        self,
+        before: FrameView,
+        action: str,
+        result: dict[str, Any],
+        after: FrameView,
+    ) -> None:
+        state_id, level_id = self._state_id(before), self._level_id(before)
+        effect = self._brief_effect(result)
+        self.state_trials[state_id][action] += 1
+        self.level_trials[level_id][action] += 1
+        self.state_outcomes[(state_id, action)] = effect
+        self.level_outcomes[(level_id, action)] = effect
+        self.visit(after)
+
+    @staticmethod
+    def _tested_actions(
+        trials: Counter[str],
+        outcomes: dict[tuple[str, str], dict[str, Any]],
+        scope: str,
+    ) -> list[dict[str, Any]]:
+        return [
+            {
+                "action": action,
+                "trials": int(trials[action]),
+                "latest_effect": outcomes.get((scope, action), {}),
+            }
+            for action in sorted(trials)
+        ]
+
+    def snapshot(self, frame: FrameView, valid_actions: list[str]) -> dict[str, Any]:
+        """Summarize exact-state and current-level coverage for the next decision."""
+        state_id, level_id = self._state_id(frame), self._level_id(frame)
+        state_trials = self.state_trials.get(state_id, Counter())
+        level_trials = self.level_trials.get(level_id, Counter())
+        explorable = sorted(action for action in valid_actions if action != "RESET")
+        return {
+            "current_state": {
+                "id": state_id,
+                "visits": int(self.state_visits.get(state_id, 0)),
+                "tested_actions": self._tested_actions(
+                    state_trials, self.state_outcomes, state_id
+                ),
+            },
+            "this_level": {
+                "tested_actions": self._tested_actions(
+                    level_trials, self.level_outcomes, level_id
+                ),
+                "untested_legal_actions": [
+                    action for action in explorable if not level_trials.get(action, 0)
+                ],
+            },
+            "note": (
+                "Coverage is observational, not a command: untested actions exclude RESET "
+                "and should be chosen only when they are a useful discriminating probe."
+            ),
+        }
 class CodeLimitExceeded(RuntimeError):
     pass
 
@@ -782,8 +884,10 @@ class PythonToolRuntime:
         self.actions_taken = 0
         self.history: list[TransitionView] = []
         self.motion_hypotheses = MotionHypothesisTracker()
+        self.exploration_ledger = ExplorationLedger()
         self.previous_frame: FrameView | None = None
         self.current_frame = self._frame_view()
+        self.exploration_ledger.visit(self.current_frame)
         self.last_action: str | None = None
         self.last_action_result: dict[str, Any] = {}
         self.last_error: str | None = None
@@ -915,6 +1019,8 @@ class PythonToolRuntime:
                 "valid_actions": self.valid_actions(),
                 "actions_taken": self.actions_taken,
             }
+            self.exploration_ledger.observe(before, action.name, result, self.current_frame)
+            result["exploration_ledger"] = self.exploration_ledger.snapshot(self.current_frame, self.valid_actions())
             self.last_action, self.last_action_result = action.name, result
             self.history.append(TransitionView(action.name, before, self.current_frame, result))
             self.logger.record("action_result", **result)
@@ -971,6 +1077,7 @@ class PythonToolRuntime:
             "last_action": self.last_action, "last_action_result": self.last_action_result,
             "valid_actions": self.valid_actions(),
             "motion_hypotheses": self.motion_hypotheses.snapshot(),
+            "exploration_ledger": self.exploration_ledger.snapshot(self.current_frame, self.valid_actions()),
             "components": self.current_frame.segmentation["nodes"],
             "view_region": self.view_region,
             "view_component": self.view_component,
@@ -990,6 +1097,7 @@ class PythonToolRuntime:
                 "last_action_result": self.last_action_result,
                 "valid_actions": self.valid_actions(),
                 "motion_hypotheses": self.motion_hypotheses.snapshot(),
+                "exploration_ledger": self.exploration_ledger.snapshot(self.current_frame, self.valid_actions()),
                 "components": self.current_frame.segmentation["nodes"],
             })
             return result
@@ -1046,6 +1154,9 @@ transitions, last_transition, last_action, last_action_result, and valid_actions
 It also begins with motion_hypotheses: conservative action-to-translation
 evidence for individual components and co-moving groups. It intentionally
 excludes objects that only grow, shrink, appear, or disappear.
+exploration_ledger records observed action coverage for the exact current board
+and this level, including untested legal non-RESET actions. It is evidence, not
+an instruction to take an action blindly.
 current_frame has .ascii, .segmentation, .shape, .step, and .level; components
 is a shorthand for current_frame.segmentation['nodes']. Use whichever board
 representation fits the question. Avoid repeatedly dumping a whole board when a
@@ -1071,7 +1182,10 @@ use motion_hypotheses to reuse verified action effects, but treat low-confidence
 or single-observation candidates as hypotheses to test rather than facts. Its
 non_translation_effects identify when a visible candidate did not move, which
 can indicate a wall, boundary, or conditional action; inspect that local area
-before repeating the same move.
+before repeating the same move. Use exploration_ledger.this_level to notice
+which legal actions have not yet been observed. When the goal remains unclear,
+prefer one untested action that distinguishes between live hypotheses rather
+than repeating a known move or gathering duplicate board dumps.
 Do not repeatedly print a full board once the relevant evidence is known.
 Make one discriminating probe at a time, then re-ground on the next turn. A
 single action per Python call is the default; do not request a batch while
@@ -1107,20 +1221,23 @@ class PythonToolAgent:
         self.max_tokens = _env_int("MY_AGENT3_MAX_TOKENS", 2048)
         self.forced_tool_choice_supported = True
 
-    def _evict(self) -> None:
-        # Preserve system instructions and the latest complete interaction.
-        if len(self.messages) > self.max_messages:
-            self.messages = [self.messages[0], *self.messages[-(self.max_messages - 1):]]
+    def _evict(self, reason: str = "message_limit") -> None:
+        """Keep the system prompt and recent reasoning/tool evidence within the limit."""
+        if len(self.messages) <= self.max_messages:
+            return
+        discarded = len(self.messages) - self.max_messages
+        self.messages = [self.messages[0], *self.messages[-(self.max_messages - 1):]]
+        self.runtime.logger.record(
+            "context_evicted", reason=reason, discarded_messages=discarded,
+            retained_messages=len(self.messages),
+        )
 
-    def _reset_for_reground(self, reason: str = "action") -> None:
-        """Discard stale tool transcripts; the next state carries durable evidence."""
-        discarded = max(0, len(self.messages) - 1)
-        self.messages = [self.messages[0]]
-        self.runtime.logger.record("context_regrounded", reason=reason, discarded_messages=discarded)
-
-    def reset_after_inspection(self) -> None:
-        """Start an explicit retry without carrying a spent inspection transcript."""
-        self._reset_for_reground(reason="inspection_retry")
+    def retain_after_inspection(self) -> None:
+        """Retry without discarding recent inspection, reasoning, or tool feedback."""
+        self._evict(reason="inspection_retry")
+        self.runtime.logger.record(
+            "context_retained", reason="inspection_retry", message_count=len(self.messages),
+        )
 
     def _turn_message(self) -> dict[str, Any]:
         frame = self.runtime.current_frame
@@ -1131,6 +1248,9 @@ class PythonToolAgent:
             "last_transition": _compact_transition_result(self.runtime.last_action_result)
             if self.runtime.last_action_result else None,
             "motion_hypotheses": self.runtime.motion_hypotheses.snapshot(),
+            "exploration_ledger": self.runtime.exploration_ledger.snapshot(
+                frame, self.runtime.valid_actions()
+            ),
             "last_error": self.runtime.last_error,
             "components": [
                 {key: node[key] for key in ("id", "color", "pixels", "bbox", "hash", "children")}
@@ -1326,7 +1446,10 @@ class PythonToolAgent:
                 if self.runtime.actions_taken > before:
                     action_executed = True
             if action_executed:
-                self._reset_for_reground()
+                self._evict(reason="action")
+                self.runtime.logger.record(
+                    "context_retained", reason="action", message_count=len(self.messages),
+                )
                 return True
             self._evict()
         return self.runtime.actions_taken > before
@@ -1382,7 +1505,7 @@ class MyAgent3Solver(Solver):
                         retry=no_action_retries, max_retries=max_no_action_retries,
                         actions_taken=runtime.actions_taken,
                     )
-                    agent.reset_after_inspection()
+                    agent.retain_after_inspection()
                     continue
                 logger.record(
                     "solver_stopped", reason="inspection_retry_exhausted",
