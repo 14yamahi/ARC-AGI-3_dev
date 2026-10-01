@@ -12,6 +12,7 @@ the normal ARC-AGI-3-Agents package does not depend on TAAF.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import base64
 import contextlib
@@ -406,8 +407,122 @@ def _region_view(board: np.ndarray, row: int, col: int, height: int, width: int)
     return {
         "bbox": [row, col, row + height - 1, col + width - 1],
         "shape": [height, width],
+        "row_labels": list(range(row, row + height)),
+        "column_labels": list(range(col, col + width)),
         "ascii": _ascii(region),
     }
+
+
+def _clamped_region_view(
+    board: np.ndarray, row: int, col: int, height: int, width: int,
+) -> dict[str, Any]:
+    """Return the requested view after clipping it to board and output limits."""
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in (row, col, height, width)):
+        raise TypeError("row, col, height, and width must be integers")
+    if height <= 0 or width <= 0:
+        raise ValueError("height and width must be positive")
+    requested = {"row": row, "col": col, "height": height, "width": width}
+    max_cells = _env_int("MY_AGENT3_MAX_REGION_CELLS", 400)
+    height, width = min(height, board.shape[0]), min(width, board.shape[1])
+    if height * width > max_cells:
+        aspect = width / height
+        height = max(1, min(height, int((max_cells / aspect) ** 0.5)))
+        width = max(1, min(width, max_cells // height))
+    top = min(max(row, 0), board.shape[0] - height)
+    left = min(max(col, 0), board.shape[1] - width)
+    view = _region_view(board, top, left, height, width)
+    view["requested"] = requested
+    view["clamped"] = requested != {
+        "row": top, "col": left, "height": height, "width": width,
+    }
+    return view
+
+
+@dataclass
+class EdgeSignalTracker:
+    """Learn when a long, thin edge component behaves like a HUD indicator.
+
+    An edge location is ignored for state fingerprints only after its component
+    count changes monotonically for several actions. Touching an edge alone
+    never makes a region a HUD.
+    """
+
+    candidates: dict[tuple[int, int, int, int, str], dict[str, Any]] = field(default_factory=dict)
+    min_progress_steps: int = field(
+        default_factory=lambda: _env_int("MY_AGENT3_HUD_CONFIRM_STEPS", 3)
+    )
+
+    @staticmethod
+    def _discover(frame: FrameView) -> dict[tuple[int, int, int, int, str], dict[str, Any]]:
+        height, width = frame.shape
+        found = {}
+        for node in frame.segmentation["nodes"]:
+            r1, c1, r2, c2 = map(int, node["bbox"])
+            box_height, box_width = r2 - r1 + 1, c2 - c1 + 1
+            horizontal = box_height <= 4 and box_width >= max(8, width // 4)
+            vertical = box_width <= 4 and box_height >= max(8, height // 4)
+            touches_edge = r1 == 0 or c1 == 0 or r2 == height - 1 or c2 == width - 1
+            if touches_edge and (horizontal or vertical):
+                key = (r1, c1, r2, c2, str(node["color"]))
+                found[key] = {"bbox": [r1, c1, r2, c2], "color": str(node["color"])}
+        return found
+
+    @staticmethod
+    def _count(frame: FrameView, bbox: list[int], color: str) -> int:
+        r1, c1, r2, c2 = bbox
+        rows = frame.ascii.splitlines()
+        return sum(row[c1:c2 + 1].count(color) for row in rows[r1:r2 + 1])
+
+    def observe(
+        self, before: FrameView, after: FrameView, summary: dict[str, Any],
+        tracked_entity_visible: bool = False,
+    ) -> dict[str, Any]:
+        for key, candidate in self._discover(before).items():
+            self.candidates.setdefault(key, {
+                **candidate, "progress_steps": 0, "last_direction": 0,
+                "verified": False, "observations": 0, "nonmoving_indicator_observations": 0,
+            })
+        changed_bbox = (summary.get("cells") or {}).get("bbox")
+        changed = bool((summary.get("cells") or {}).get("count", 0))
+        for candidate in self.candidates.values():
+            old_count = self._count(before, candidate["bbox"], candidate["color"])
+            new_count = self._count(after, candidate["bbox"], candidate["color"])
+            delta = new_count - old_count
+            if not delta:
+                continue
+            candidate["observations"] += 1
+            direction = 1 if delta > 0 else -1
+            candidate["progress_steps"] = (
+                candidate["progress_steps"] + 1
+                if candidate["last_direction"] == direction else 1
+            )
+            candidate["last_direction"] = direction
+        hud_only = False
+        if changed and changed_bbox:
+            cr1, cc1, cr2, cc2 = changed_bbox
+            for candidate in self.candidates.values():
+                r1, c1, r2, c2 = candidate["bbox"]
+                inside = r1 <= cr1 <= cr2 <= r2 and c1 <= cc1 <= cc2 <= c2
+                if inside and not summary.get("moved_components") and tracked_entity_visible:
+                    candidate["nonmoving_indicator_observations"] += 1
+                    if (
+                        candidate["progress_steps"] >= self.min_progress_steps
+                        and candidate["nonmoving_indicator_observations"] >= 2
+                    ):
+                        candidate["verified"] = True
+                if candidate["verified"] and inside and not summary.get("moved_components"):
+                    hud_only = True
+                    break
+        return {
+            "classification": "likely_hud_only" if hud_only else "gameplay_or_uncertain",
+            "gameplay_changed": bool(changed and not hud_only),
+            "candidate_indicators": [dict(value) for value in self.candidates.values()],
+        }
+
+    def ignored_regions(self) -> list[list[int]]:
+        return [value["bbox"] for value in self.candidates.values() if value["verified"]]
+
+
 
 
 def _relative_pattern_mismatches(first: np.ndarray, second: np.ndarray) -> int:
@@ -490,11 +605,12 @@ def _compact_transition_result(result: dict[str, Any]) -> dict[str, Any]:
     """Keep a fresh turn informative without replaying verbose tool output."""
     summary = result.get("change_summary") or {}
     cells = summary.get("cells") or {}
+    prediction_check = result.get("prediction_check")
     return {
         key: result.get(key)
         for key in (
-            "action", "board_changed", "level_completed", "game_over", "done",
-            "valid_actions", "actions_taken",
+            "action", "board_changed", "gameplay_changed", "hud_assessment",
+            "level_completed", "game_over", "done", "valid_actions", "actions_taken",
         )
     } | {
         "change": {
@@ -513,7 +629,13 @@ def _compact_transition_result(result: dict[str, Any]) -> dict[str, Any]:
             "disappeared_count": len(summary.get("disappeared_components", [])),
             "tracking_truncated": summary.get("tracking_truncated", False),
         },
-    }
+    } | (
+        {"prediction_check": {
+            key: prediction_check.get(key)
+            for key in ("action", "expected", "matched", "observed")
+        }}
+        if prediction_check is not None else {}
+    )
 
 
 def _repair_trailing_tool_artifact(code: str) -> str | None:
@@ -527,6 +649,25 @@ def _repair_trailing_tool_artifact(code: str) -> str | None:
             return repaired
     return None
 
+def _uses_direct_ascii(code: str) -> bool:
+    """Reject unbounded board-string access from model-authored code."""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return False
+    return any(
+        (isinstance(node, ast.Attribute) and node.attr == "ascii")
+        or (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "getattr"
+            and len(node.args) >= 2
+            and isinstance(node.args[1], ast.Constant)
+            and node.args[1].value == "ascii"
+        )
+        for node in ast.walk(tree)
+
+    )
 
 
 
@@ -558,6 +699,9 @@ class MotionHypothesisTracker:
         default_factory=lambda: _env_int("MY_AGENT3_MAX_MOTION_HYPOTHESES", 64)
     )
     action_trials: Counter[str] = field(default_factory=Counter)
+    candidate_trials: dict[tuple[tuple[str, int, str], ...], Counter[str]] = field(
+        default_factory=dict
+    )
     candidates: dict[tuple[tuple[str, int, str], ...], Counter[tuple[str, int, int]]] = field(
         default_factory=dict
     )
@@ -606,6 +750,7 @@ class MotionHypothesisTracker:
         for members in self.candidates:
             if not all(visible_nodes.get(member) for member in members):
                 continue
+            self.candidate_trials.setdefault(members, Counter())[action] += 1
             if any(member in moved_members for member in members):
                 continue
             effects = self.non_translation_effects.setdefault(members, Counter())
@@ -634,7 +779,10 @@ class MotionHypothesisTracker:
             for members in member_groups:
                 if members not in self.candidates and len(self.candidates) >= self.max_candidates:
                     continue
+                is_new_candidate = members not in self.candidates
                 effects = self.candidates.setdefault(members, Counter())
+                if is_new_candidate:
+                    self.candidate_trials.setdefault(members, Counter())[action] += 1
                 effects[(action, row_delta, col_delta)] += 1
 
     def snapshot(self) -> dict[str, Any]:
@@ -651,7 +799,7 @@ class MotionHypothesisTracker:
                 ]
                 support, row_delta, col_delta = max(options)
                 total_support += support
-                trials = self.action_trials[action]
+                trials = self.candidate_trials.get(members, Counter())[action]
                 consistency = support / trials if trials else 0.0
                 # One observation is useful but not proof; repeated, consistent
                 # probes asymptotically approach 1.0.
@@ -779,8 +927,14 @@ class ExplorationLedger:
     level_outcomes: dict[tuple[str, str], dict[str, Any]] = field(default_factory=dict)
 
     @staticmethod
-    def _state_id(frame: FrameView) -> str:
-        digest = hashlib.blake2b(frame.ascii.encode("utf-8"), digest_size=6).hexdigest()
+    def _state_id(frame: FrameView, ignored_regions: list[list[int]] | None = None) -> str:
+        rows = [list(row) for row in frame.ascii.splitlines()]
+        for r1, c1, r2, c2 in ignored_regions or []:
+            for row in range(max(0, r1), min(len(rows), r2 + 1)):
+                for col in range(max(0, c1), min(len(rows[row]), c2 + 1)):
+                    rows[row][col] = "*"
+        fingerprint = "\n".join("".join(row) for row in rows)
+        digest = hashlib.blake2b(fingerprint.encode("utf-8"), digest_size=6).hexdigest()
         return f"L{frame.level if frame.level is not None else '?'}:{digest}"
 
     @staticmethod
@@ -793,6 +947,7 @@ class ExplorationLedger:
         cells = summary.get("cells") or {}
         return {
             "board_changed": bool(result.get("board_changed")),
+            "gameplay_changed": bool(result.get("gameplay_changed")),
             "changed_cells": int(cells.get("count", 0)),
             "moved": [
                 {
@@ -806,8 +961,8 @@ class ExplorationLedger:
             "game_over": bool(result.get("game_over")),
         }
 
-    def visit(self, frame: FrameView) -> None:
-        self.state_visits[self._state_id(frame)] += 1
+    def visit(self, frame: FrameView, ignored_regions: list[list[int]] | None = None) -> None:
+        self.state_visits[self._state_id(frame, ignored_regions)] += 1
 
     def observe(
         self,
@@ -815,14 +970,15 @@ class ExplorationLedger:
         action: str,
         result: dict[str, Any],
         after: FrameView,
+        ignored_regions: list[list[int]] | None = None,
     ) -> None:
-        state_id, level_id = self._state_id(before), self._level_id(before)
+        state_id, level_id = self._state_id(before, ignored_regions), self._level_id(before)
         effect = self._brief_effect(result)
         self.state_trials[state_id][action] += 1
         self.level_trials[level_id][action] += 1
         self.state_outcomes[(state_id, action)] = effect
         self.level_outcomes[(level_id, action)] = effect
-        self.visit(after)
+        self.visit(after, ignored_regions)
 
     @staticmethod
     def _tested_actions(
@@ -839,9 +995,12 @@ class ExplorationLedger:
             for action in sorted(trials)
         ]
 
-    def snapshot(self, frame: FrameView, valid_actions: list[str]) -> dict[str, Any]:
-        """Summarize exact-state and current-level coverage for the next decision."""
-        state_id, level_id = self._state_id(frame), self._level_id(frame)
+    def snapshot(
+        self, frame: FrameView, valid_actions: list[str],
+        ignored_regions: list[list[int]] | None = None,
+    ) -> dict[str, Any]:
+        """Summarize state-action coverage, ignoring verified HUD regions."""
+        state_id, level_id = self._state_id(frame, ignored_regions), self._level_id(frame)
         state_trials = self.state_trials.get(state_id, Counter())
         level_trials = self.level_trials.get(level_id, Counter())
         explorable = sorted(action for action in valid_actions if action != "RESET")
@@ -866,8 +1025,174 @@ class ExplorationLedger:
                 "and should be chosen only when they are a useful discriminating probe."
             ),
         }
+    def has_tested_this_level(self, frame: FrameView, action: str) -> bool:
+        return bool(self.level_trials.get(self._level_id(frame), Counter()).get(action, 0))
+
+
+
+@dataclass
+class PredictionLedger:
+    """Check model-stated action expectations and retain their evidence."""
+
+    max_recent: int = field(
+        default_factory=lambda: _env_int("MY_AGENT3_PREDICTION_SAMPLES", 8)
+    )
+    pending: tuple[str, dict[str, Any]] | None = None
+    replan_required: dict[str, Any] | None = None
+    recent: deque[dict[str, Any]] = field(default_factory=deque)
+    rule_stats: dict[tuple[str, str], dict[str, Any]] = field(default_factory=dict)
+
+    def clear_pending(self) -> None:
+        self.pending = None
+
+    def set_pending(self, action: str, expected: dict[str, Any]) -> dict[str, Any]:
+        self.pending = (action, expected)
+        return {"action": action, "expected": expected, "status": "registered_for_next_action"}
+
+    def take_pending(self, action: str) -> dict[str, Any] | None:
+        pending = self.pending
+        self.pending = None
+        if pending is None:
+            return None
+        expected_action, expected = pending
+        if expected_action != action:
+            raise ValueError(
+                f"prediction was registered for {expected_action}, not requested {action}"
+            )
+        return expected
+
+    @staticmethod
+    def _observed_effect(result: dict[str, Any]) -> dict[str, Any]:
+        summary = result.get("change_summary") or {}
+        cells = summary.get("cells") or {}
+        moved = [
+            {
+                key: int(component[key])
+                for key in ("row_delta", "col_delta")
+                if key in component
+            }
+            for component in summary.get("moved_components", [])
+        ]
+        return {
+            "board_changed": bool(result.get("board_changed")),
+            "gameplay_changed": bool(result.get("gameplay_changed")),
+            "moved": bool(moved),
+            "deltas": moved[:4],
+            "level_completed": bool(result.get("level_completed")),
+            "game_over": bool(result.get("game_over")),
+            "changed_cells": int(cells.get("count", 0)),
+        }
+
+    @staticmethod
+    def _matches(expected: dict[str, Any], observed: dict[str, Any]) -> bool:
+        for key in ("board_changed", "gameplay_changed", "moved", "level_completed", "game_over"):
+            if key in expected and observed[key] != expected[key]:
+                return False
+        requested_delta = {
+            key: expected[key] for key in ("row_delta", "col_delta") if key in expected
+        }
+        if requested_delta and not any(
+            all(delta.get(key) == value for key, value in requested_delta.items())
+            for delta in observed["deltas"]
+        ):
+            return False
+        return True
+
+    def observe(
+        self, action: str, expected: dict[str, Any], result: dict[str, Any],
+    ) -> dict[str, Any]:
+        observed = self._observed_effect(result)
+        matched = self._matches(expected, observed)
+        record = {
+            "action": action, "expected": expected, "matched": matched, "observed": observed,
+        }
+        self.recent.append(record)
+        while len(self.recent) > self.max_recent:
+            self.recent.popleft()
+        key = (action, json.dumps(expected, sort_keys=True, separators=(",", ":")))
+        stats = self.rule_stats.setdefault(
+            key, {"action": action, "expected": expected, "confirmed": 0, "mismatches": 0},
+        )
+        stats["confirmed" if matched else "mismatches"] += 1
+        stats["latest_observed"] = observed
+        if not matched:
+            self.replan_required = record
+        return record
+
+    def acknowledge_replan(self, note: str) -> dict[str, Any]:
+        mismatch = self.replan_required
+        if mismatch is None:
+            return {"status": "no_replan_was_required"}
+        self.replan_required = None
+        return {
+            "status": "replan_acknowledged",
+            "note": note,
+            "mismatch": mismatch,
+        }
+
+    def needs_replan(self) -> bool:
+        return self.replan_required is not None
+
+    def snapshot(self) -> dict[str, Any]:
+        rules = sorted(
+            self.rule_stats.values(),
+            key=lambda rule: (-int(rule["confirmed"]), int(rule["mismatches"]), rule["action"]),
+        )
+        return {
+            "repeat_prediction_required": True,
+            "replan_required": self.needs_replan(),
+            "latest_mismatch": self.replan_required,
+            "verified_rules": [rule for rule in rules if rule["confirmed"]][:self.max_recent],
+            "recent_checks": list(self.recent),
+            "note": (
+                "A previously observed non-RESET action requires predict(action, expected) "
+                "in the same Python call. A mismatch means re-plan from the observed state."
+            ),
+        }
+
+
+
 class CodeLimitExceeded(RuntimeError):
     pass
+
+
+@dataclass
+class WorldModel:
+    """Small, durable evidence store for hypotheses across context eviction."""
+
+    max_entries: int = field(default_factory=lambda: _env_int("MY_AGENT3_WORLD_NOTES", 10))
+    entries: list[dict[str, Any]] = field(default_factory=list)
+
+    def remember(
+        self, claim: Any, status: Any, evidence: Any, level: int | None,
+    ) -> dict[str, Any]:
+        if not isinstance(claim, str) or not claim.strip():
+            raise ValueError("claim must be a non-empty string")
+        if status not in {"verified", "hypothesis", "rejected"}:
+            raise ValueError("status must be verified, hypothesis, or rejected")
+        if not isinstance(evidence, str):
+            raise TypeError("evidence must be a string")
+        entry = {
+            "claim": claim.strip()[:240], "status": status,
+            "evidence": evidence.strip()[:320], "level": level,
+        }
+        self.entries = [
+            item for item in self.entries
+            if not (item["claim"] == entry["claim"] and item["level"] == level)
+        ]
+        self.entries.append(entry)
+        self.entries = self.entries[-self.max_entries:]
+        return dict(entry)
+
+    def snapshot(self, level: int | None) -> dict[str, Any]:
+        return {
+            "current_level": [item for item in self.entries if item["level"] == level],
+            "prior_verified": [
+                item for item in self.entries
+                if item["level"] != level and item["status"] == "verified"
+            ][-3:],
+            "note": "Prior-level rules are candidates to re-check, not guaranteed to transfer.",
+        }
 
 
 class PythonToolRuntime:
@@ -884,10 +1209,13 @@ class PythonToolRuntime:
         self.actions_taken = 0
         self.history: list[TransitionView] = []
         self.motion_hypotheses = MotionHypothesisTracker()
+        self.edge_signals = EdgeSignalTracker()
         self.exploration_ledger = ExplorationLedger()
+        self.prediction_ledger = PredictionLedger()
+        self.world_model = WorldModel()
         self.previous_frame: FrameView | None = None
         self.current_frame = self._frame_view()
-        self.exploration_ledger.visit(self.current_frame)
+        self.exploration_ledger.visit(self.current_frame, self.edge_signals.ignored_regions())
         self.last_action: str | None = None
         self.last_action_result: dict[str, Any] = {}
         self.last_error: str | None = None
@@ -940,8 +1268,20 @@ class PythonToolRuntime:
         return action, params
 
     def view_region(self, row: int, col: int, height: int, width: int) -> dict[str, Any]:
-        """Return a small coordinate-labelled crop for visual motif inspection."""
+        """Return a strict coordinate-labelled crop for visual motif inspection."""
         return _region_view(_board_from_state(self.game.current_state), row, col, height, width)
+
+    def view_region_clamped(self, row: int, col: int, height: int, width: int) -> dict[str, Any]:
+        """Return a crop clipped to the board and configured cell limit."""
+        return _clamped_region_view(
+            _board_from_state(self.game.current_state), row, col, height, width
+        )
+
+    def remember(self, claim: Any, status: Any, evidence: Any = "") -> dict[str, Any]:
+        """Store a concise, level-scoped world-model claim across model turns."""
+        entry = self.world_model.remember(claim, status, evidence, self.current_frame.level)
+        self.logger.record("world_model_note", **entry)
+        return entry
 
     def view_component(self, component_id: int, padding: int = 1) -> dict[str, Any]:
         """Return a bounded crop around one current-frame component."""
@@ -959,7 +1299,10 @@ class PythonToolRuntime:
         board = _board_from_state(self.game.current_state)
         top, left = max(0, row1 - padding), max(0, col1 - padding)
         bottom, right = min(board.shape[0] - 1, row2 + padding), min(board.shape[1] - 1, col2 + padding)
-        return {"component": _component_brief(node), **_region_view(board, top, left, bottom - top + 1, right - left + 1)}
+        return {
+            "component": _component_brief(node),
+            **_clamped_region_view(board, top, left, bottom - top + 1, right - left + 1),
+        }
 
     def compare_regions(
         self,
@@ -977,6 +1320,42 @@ class PythonToolRuntime:
             _board_from_state(self.game.current_state), row1, col1, row2, col2,
             height, width, rotations, reflections,
         )
+
+    def replan(self, note: Any) -> dict[str, Any]:
+        """Acknowledge and describe the investigation after a failed prediction."""
+        if not isinstance(note, str) or not note.strip():
+            raise ValueError("replan note must be a non-empty string")
+        acknowledgement = self.prediction_ledger.acknowledge_replan(note.strip())
+        self.logger.record(
+            "replan_acknowledged", status=acknowledgement["status"], note=note.strip()
+        )
+        return acknowledgement
+
+    def predict(self, action_name: Any, expected: Any) -> dict[str, Any]:
+        """Register a check for the next same-call action without changing the board."""
+        action = _game_action(action_name)
+        if action.name not in self.valid_actions():
+            raise ValueError(f"{action.name} is not currently legal; valid_actions={self.valid_actions()}")
+        if not isinstance(expected, dict) or not expected:
+            raise ValueError("expected must be a non-empty dict")
+        allowed = {
+            "board_changed", "gameplay_changed", "moved", "row_delta", "col_delta",
+            "level_completed", "game_over",
+        }
+        unknown = sorted(set(expected) - allowed)
+        if unknown:
+            raise ValueError(f"unsupported prediction fields: {unknown}")
+        normalized: dict[str, Any] = {}
+        for key, value in expected.items():
+            if key in {"board_changed", "gameplay_changed", "moved", "level_completed", "game_over"}:
+                if not isinstance(value, bool):
+                    raise TypeError(f"prediction {key} must be a bool")
+            elif isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"prediction {key} must be an integer")
+            normalized[key] = value
+        return self.prediction_ledger.set_pending(action.name, normalized)
+
+
 
     def action(self, requests: Any) -> list[dict[str, Any]]:
         """Execute one or more legal actions, returning compact transition metadata."""
@@ -997,6 +1376,19 @@ class PythonToolRuntime:
             before = self.current_frame
             before_board = _board_from_state(self.game.current_state).copy()
             action, data = self._parse_action(request)
+            if action.name != "RESET" and self.prediction_ledger.needs_replan():
+                self.logger.record("replan_required", action=action.name)
+                raise ValueError(
+                    "the previous prediction mismatched; inspect the changed region and call "
+                    "replan('what the mismatch means') before another non-RESET action"
+                )
+            prediction = self.prediction_ledger.take_pending(action.name)
+            if action.name != "RESET" and self.exploration_ledger.has_tested_this_level(before, action.name) and prediction is None:
+                self.logger.record("prediction_required", action=action.name)
+                raise ValueError(
+                    f"{action.name} was already observed this level; call "
+                    "predict('ACTION_NAME', expected) before repeating it"
+                )
             self.logger.record("action_requested", action=action.name, data=data)
             self.game.execute_action(arcengine.ActionInput(id=action, data=data))
             self.actions_taken += 1
@@ -1007,10 +1399,34 @@ class PythonToolRuntime:
                 before_board, after_board, before.segmentation, self.current_frame.segmentation,
             )
             self.motion_hypotheses.observe(action.name, change_summary, before.segmentation)
+            visible_keys = {
+                _motion_member_key(node) for node in before.segmentation["nodes"]
+            }
+            tracked_entity_visible = any(
+                all(member in visible_keys for member in members)
+                for members in self.motion_hypotheses.candidates
+            )
+            if before.level != self.current_frame.level:
+                self.edge_signals.candidates.clear()
+                hud_assessment = {
+                    "classification": "level_changed",
+                    "gameplay_changed": True,
+                    "candidate_indicators": [],
+                }
+            else:
+                hud_assessment = self.edge_signals.observe(
+                    before, self.current_frame, change_summary, tracked_entity_visible
+                )
             raw = self.game.current_state.raw
+            board_changed = before.ascii != self.current_frame.ascii
             result = {
                 "action": action.name,
-                "board_changed": before.ascii != self.current_frame.ascii,
+                "board_changed": board_changed,
+                "gameplay_changed": (
+                    hud_assessment["gameplay_changed"]
+                    or before.level != self.current_frame.level
+                ),
+                "hud_assessment": hud_assessment,
                 "change_summary": change_summary,
                 "motion_hypotheses": self.motion_hypotheses.snapshot(),
                 "level_completed": before.level != self.current_frame.level,
@@ -1019,8 +1435,16 @@ class PythonToolRuntime:
                 "valid_actions": self.valid_actions(),
                 "actions_taken": self.actions_taken,
             }
-            self.exploration_ledger.observe(before, action.name, result, self.current_frame)
-            result["exploration_ledger"] = self.exploration_ledger.snapshot(self.current_frame, self.valid_actions())
+            ignored_regions = self.edge_signals.ignored_regions()
+            self.exploration_ledger.observe(
+                before, action.name, result, self.current_frame, ignored_regions
+            )
+            if prediction is not None:
+                result["prediction_check"] = self.prediction_ledger.observe(action.name, prediction, result)
+            result["exploration_ledger"] = self.exploration_ledger.snapshot(
+                self.current_frame, self.valid_actions(), ignored_regions
+            )
+            result["prediction_ledger"] = self.prediction_ledger.snapshot()
             self.last_action, self.last_action_result = action.name, result
             self.history.append(TransitionView(action.name, before, self.current_frame, result))
             self.logger.record("action_result", **result)
@@ -1045,6 +1469,10 @@ class PythonToolRuntime:
             return json.dumps({"error": f"code exceeds {self.MAX_CODE_CHARS} characters"})
         if "__" in code:
             return json.dumps({"error": "dunder names are disabled in the Python tool"})
+        if _uses_direct_ascii(code):
+            self.logger.record("direct_ascii_blocked")
+            return json.dumps({"error": "Direct .ascii access is disabled; use view_region or view_component."})
+        self.prediction_ledger.clear_pending()
         output = io.StringIO()
         events = 0
 
@@ -1077,18 +1505,28 @@ class PythonToolRuntime:
             "last_action": self.last_action, "last_action_result": self.last_action_result,
             "valid_actions": self.valid_actions(),
             "motion_hypotheses": self.motion_hypotheses.snapshot(),
-            "exploration_ledger": self.exploration_ledger.snapshot(self.current_frame, self.valid_actions()),
+            "exploration_ledger": self.exploration_ledger.snapshot(
+                self.current_frame, self.valid_actions(), self.edge_signals.ignored_regions()
+            ),
+            "prediction_ledger": self.prediction_ledger.snapshot(),
+            "world_model": self.world_model.snapshot(self.current_frame.level),
+            "hud_signals": self.last_action_result.get("hud_assessment", {}),
             "components": self.current_frame.segmentation["nodes"],
             "view_region": self.view_region,
+            "view_region_clamped": self.view_region_clamped,
+            "replan": self.replan,
+            "remember": self.remember,
             "view_component": self.view_component,
             "compare_regions": self.compare_regions,
+            "predict": self.predict,
         }
         action_results: list[dict[str, Any]] = []
 
         def action_wrapper(requests: Any) -> list[dict[str, Any]]:
             """Refresh global tool variables before Python continues after action()."""
             result = self.action(requests)
-            action_results.extend(result)
+            compact_results = [_compact_transition_result(item) for item in result]
+            action_results.extend(compact_results)
             namespace.update({
                 "current_frame": self.current_frame,
                 "previous_frame": self.previous_frame,
@@ -1097,10 +1535,15 @@ class PythonToolRuntime:
                 "last_action_result": self.last_action_result,
                 "valid_actions": self.valid_actions(),
                 "motion_hypotheses": self.motion_hypotheses.snapshot(),
-                "exploration_ledger": self.exploration_ledger.snapshot(self.current_frame, self.valid_actions()),
+                "exploration_ledger": self.exploration_ledger.snapshot(
+                    self.current_frame, self.valid_actions(), self.edge_signals.ignored_regions()
+                ),
+                "prediction_ledger": self.prediction_ledger.snapshot(),
+                "world_model": self.world_model.snapshot(self.current_frame.level),
+                "hud_signals": self.last_action_result.get("hud_assessment", {}),
                 "components": self.current_frame.segmentation["nodes"],
             })
-            return result
+            return compact_results
 
         namespace["action"] = action_wrapper
         self.logger.record("python_script", code=code)
@@ -1154,46 +1597,66 @@ transitions, last_transition, last_action, last_action_result, and valid_actions
 It also begins with motion_hypotheses: conservative action-to-translation
 evidence for individual components and co-moving groups. It intentionally
 excludes objects that only grow, shrink, appear, or disappear.
-exploration_ledger records observed action coverage for the exact current board
-and this level, including untested legal non-RESET actions. It is evidence, not
-an instruction to take an action blindly.
-current_frame has .ascii, .segmentation, .shape, .step, and .level; components
-is a shorthand for current_frame.segmentation['nodes']. Use whichever board
-representation fits the question. Avoid repeatedly dumping a whole board when a
-targeted ASCII slice or helper result will answer it.
+exploration_ledger tracks tested actions and revisited gameplay states,
+excluding only edge regions verified as steadily changing indicators. It is
+evidence, not an instruction to act blindly. prediction_ledger retains checks
+for model-stated predictions. predict(action, expected) registers one check for
+the next action in the same Python call.
+world_model contains compact notes that persist across context eviction; call
+remember(claim, status, evidence) to preserve important facts and hypotheses.
+Status is verified, hypothesis, or rejected.
+current_frame has .segmentation, .shape, .step, and .level; components is a
+shorthand for current_frame.segmentation['nodes']. Direct .ascii access is
+disabled: inspect focused crops with view_region_clamped or view_component.
+Crops return [row_min, col_min, row_max, col_max] plus row/column labels. Rows
+increase downward; columns increase rightward. hud_signals reports edge
+components whose repeated monotonic changes may indicate HUD; do not treat them
+as proof of puzzle progress.
 segmentation is {'nodes': [...], 'adjacency_list': [...]}; node ids are local to
 the current frame. Use compact summaries rather than printing whole boards.
-Optional visual helpers are view_region(row, col, height, width),
-view_component(component_id, padding=1), and compare_regions(row1, col1, row2,
-col2, height, width). compare_regions tests exact and colour-remapped pattern
-matches, including rotations/reflections by default. Before calling an object a
-goal, inspect its local pattern and either compare it with a related motif or
-obtain an action outcome that supports the claim. Do not infer a goal from an
-icon's colour or bounding box alone.
+Optional visual helpers are view_region_clamped(row, col, height, width),
+view_region(row, col, height, width), view_component(component_id, padding=1),
+and compare_regions(row1, col1, row2, col2, height, width). The clamped view
+clips to board bounds and the output-cell limit. compare_regions tests exact and
+colour-remapped patterns, including rotations/reflections by default. Before
+calling an object a goal, inspect its local pattern and either compare it with a
+related motif or obtain an action outcome that supports the claim. Do not infer
+a goal from an icon's colour or bounding box alone.
 
-action accepts a list such as action(['ACTION1']) or
-action([{'action': 'MOUSE', 'row': 4, 'col': 7}]). It validates actions against
-valid_actions, executes them immediately, and refreshes every state variable.
+Call action(["ACTION1"]) or action([{"action": "MOUSE", "row": 4, "col": 7}]).
+The runtime validates actions and refreshes every state variable immediately.
+For a non-RESET action already observed this level, call predict immediately
+before action, for example:
+predict("ACTION1", {"gameplay_changed": True, "moved": True, "row_delta": -5})
+action(["ACTION1"])
+Valid expectation keys are board_changed, gameplay_changed, moved, row_delta,
+col_delta, level_completed, and game_over. board_changed includes any pixel
+change; gameplay_changed discounts only a strongly repeated edge indicator.
+Prefer gameplay_changed and relevant object movement when predicting progress.
+First probes need no prediction. A mismatch sets
+prediction_ledger.replan_required. Inspect the local change or relevant
+components, update world_model, then call replan("what the mismatch implies")
+before another non-RESET action. Treat the observed result as ground truth.
 Every action call automatically returns action_feedback, even if your Python
 code does not assign or print its return value. action_feedback.change_summary
 reports changed cells and conservatively matched moved components with explicit
-row_delta (negative=up) and col_delta (negative=left). Use that feedback first;
-use motion_hypotheses to reuse verified action effects, but treat low-confidence
-or single-observation candidates as hypotheses to test rather than facts. Its
-non_translation_effects identify when a visible candidate did not move, which
-can indicate a wall, boundary, or conditional action; inspect that local area
-before repeating the same move. Use exploration_ledger.this_level to notice
-which legal actions have not yet been observed. When the goal remains unclear,
-prefer one untested action that distinguishes between live hypotheses rather
-than repeating a known move or gathering duplicate board dumps.
-Do not repeatedly print a full board once the relevant evidence is known.
-Make one discriminating probe at a time, then re-ground on the next turn. A
-single action per Python call is the default; do not request a batch while
-discovering movement or obstacles.
-Keep reasoning concise and call python promptly. Do not restate the action map
-or speculate about a target when the next discriminating inspection is clear.
-Explore before writing BFS/search code when the mechanism is understood. A game
-need not have a moving player.
+row_delta (negative=up) and col_delta (negative=left). Use this feedback
+before making another claim. Motion rules vary by location and blockers; a
+successful move elsewhere does not predict movement at a boundary. Re-check
+current object location and latest non-translation evidence before repeating.
+Use exploration_ledger["this_level"] and
+exploration_ledger["current_state"]["tested_actions"] to spot tried actions and
+gameplay-state revisits; avoid cycles that do not progress.
+When unclear, choose one action that distinguishes live hypotheses. Record only
+useful evidence with remember(...), and mark unresolved interpretations as
+hypothesis. Once the goal and action rules have evidence, search or plan over
+the inferred state space instead of continuing exploratory moves. Games may not
+have a moving player. After every action, distinguish object/goal changes from
+likely HUD changes; board_changed alone does not mean progress.
+Do not repeatedly print full boards after relevant evidence is known. Use one
+action per Python call while discovering mechanics; batch only a short sequence
+whose transitions have already been verified. Keep reasoning concise and call
+python promptly.
 """
 
 
@@ -1249,9 +1712,12 @@ class PythonToolAgent:
             if self.runtime.last_action_result else None,
             "motion_hypotheses": self.runtime.motion_hypotheses.snapshot(),
             "exploration_ledger": self.runtime.exploration_ledger.snapshot(
-                frame, self.runtime.valid_actions()
+                frame, self.runtime.valid_actions(), self.runtime.edge_signals.ignored_regions()
             ),
+            "hud_signals": self.runtime.last_action_result.get("hud_assessment", {}),
+            "world_model": self.runtime.world_model.snapshot(frame.level),
             "last_error": self.runtime.last_error,
+            "prediction_ledger": self.runtime.prediction_ledger.snapshot(),
             "components": [
                 {key: node[key] for key in ("id", "color", "pixels", "bbox", "hash", "children")}
                 for node in frame.segmentation["nodes"][:100]
