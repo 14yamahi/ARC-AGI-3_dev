@@ -36,8 +36,8 @@ from openai import (
     APIConnectionError,
     APIStatusError,
     APITimeoutError,
+    AsyncOpenAI,
     BadRequestError,
-    OpenAI,
 )
 from PIL import Image
 from taaf.solver import Solver
@@ -157,6 +157,8 @@ def _game_action(value: Any) -> arcengine.GameAction:
         return arcengine.GameAction.from_id(value)
     if isinstance(value, str):
         name = value.upper().strip()
+        if name == "MOUSE":
+            name = "ACTION6"
         try:
             return arcengine.GameAction.from_name(name)
         except (AttributeError, KeyError, ValueError):
@@ -1252,19 +1254,31 @@ class PythonToolRuntime:
             params = dict(request.get("data") or {})
             # Duck-style mouse calls are row/col; ARC Engine takes x/y.
             if "row" in request:
-                params.setdefault("y", int(request["row"]))
+                params.setdefault("y", request["row"])
             if "col" in request:
-                params.setdefault("x", int(request["col"]))
+                params.setdefault("x", request["col"])
             for key in ("x", "y"):
                 if key in request:
-                    params.setdefault(key, int(request[key]))
+                    params.setdefault(key, request[key])
         else:
             raw, params = request, {}
         action = _game_action(raw)
         if action.name not in self.valid_actions():
             raise ValueError(f"{action.name} is not currently legal; valid_actions={self.valid_actions()}")
-        if action.name == "MOUSE" and not {"x", "y"}.issubset(params):
-            raise ValueError("MOUSE requires both x and y (or row and col)")
+        if action.name == "ACTION6":
+            if not {"x", "y"}.issubset(params):
+                raise ValueError(
+                    "ACTION6 is a click and requires x/y or row/col; "
+                    "use action([{'action': 'ACTION6', 'row': 4, 'col': 7}])"
+                )
+            height, width = self.current_frame.shape
+            for key, limit in (("x", width), ("y", height)):
+                value = params[key]
+                if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+                    raise TypeError(f"ACTION6 {key} must be an integer")
+                if not 0 <= value < limit:
+                    raise ValueError(f"ACTION6 {key}={value} is outside the board")
+                params[key] = int(value)
         return action, params
 
     def view_region(self, row: int, col: int, height: int, width: int) -> dict[str, Any]:
@@ -1456,7 +1470,7 @@ class PythonToolRuntime:
 
     @staticmethod
     def _safe_import(name: str, globals_: Any = None, locals_: Any = None, fromlist: Any = (), level: int = 0) -> Any:
-        allowed = {"bisect", "collections", "copy", "fractions", "functools", "heapq", "itertools", "json", "math", "operator", "random", "re", "statistics", "string"}
+        allowed = {"numpy", "hashlib", "bisect", "collections", "copy", "fractions", "functools", "heapq", "itertools", "json", "math", "operator", "random", "re", "statistics", "string"}
         root = name.split(".", 1)[0]
         if level or root not in allowed:
             raise ImportError(f"Import {name!r} is not available in the Python tool")
@@ -1492,7 +1506,11 @@ class PythonToolRuntime:
         safe_builtins = {
             "abs": abs, "all": all, "any": any, "bool": bool, "dict": dict,
             "dir": dir, "enumerate": enumerate, "filter": filter, "float": float,
-            "frozenset": frozenset, "getattr": getattr,
+            "frozenset": frozenset, "getattr": getattr, "hasattr": hasattr,
+            "isinstance": isinstance, "type": type,
+            "Exception": Exception, "ValueError": ValueError, "TypeError": TypeError,
+            "KeyError": KeyError, "IndexError": IndexError, "RuntimeError": RuntimeError,
+            "NameError": NameError,
             "int": int, "len": len, "list": list, "map": map, "max": max, "min": min,
             "print": print, "range": range, "reversed": reversed, "round": round, "set": set,
             "sorted": sorted, "str": str, "sum": sum, "tuple": tuple, "zip": zip,
@@ -1503,6 +1521,7 @@ class PythonToolRuntime:
             "previous_frame": self.previous_frame, "history": self.history,
             "transitions": self.history, "last_transition": self.history[-1] if self.history else None,
             "last_action": self.last_action, "last_action_result": self.last_action_result,
+            "last_error": self.last_error, "np": np,
             "valid_actions": self.valid_actions(),
             "motion_hypotheses": self.motion_hypotheses.snapshot(),
             "exploration_ledger": self.exploration_ledger.snapshot(
@@ -1623,7 +1642,11 @@ calling an object a goal, inspect its local pattern and either compare it with a
 related motif or obtain an action outcome that supports the claim. Do not infer
 a goal from an icon's colour or bounding box alone.
 
-Call action(["ACTION1"]) or action([{"action": "MOUSE", "row": 4, "col": 7}]).
+Call action(["ACTION1"]) for a directional action. ACTION6 is a coordinate click:
+action([{"action": "ACTION6", "row": 4, "col": 7}])
+Always include both coordinates for ACTION6. Use predict("ACTION6", expected)
+before a repeated click; predictions take an action name, never coordinates.
+MOUSE is accepted as an ACTION6 alias, but prefer the names in valid_actions.
 The runtime validates actions and refreshes every state variable immediately.
 For a non-RESET action already observed this level, call predict immediately
 before action, for example:
@@ -1638,7 +1661,7 @@ prediction_ledger.replan_required. Inspect the local change or relevant
 components, update world_model, then call replan("what the mismatch implies")
 before another non-RESET action. Treat the observed result as ground truth.
 Every action call automatically returns action_feedback, even if your Python
-code does not assign or print its return value. action_feedback.change_summary
+code does not assign or print its return value. action_feedback is a list of compact results. Each result['change']
 reports changed cells and conservatively matched moved components with explicit
 row_delta (negative=up) and col_delta (negative=left). Use this feedback
 before making another claim. Motion rules vary by location and blockers; a
@@ -1655,7 +1678,13 @@ have a moving player. After every action, distinguish object/goal changes from
 likely HUD changes; board_changed alone does not mean progress.
 Do not repeatedly print full boards after relevant evidence is known. Use one
 action per Python call while discovering mechanics; batch only a short sequence
-whose transitions have already been verified. Keep reasoning concise and call
+whose transitions have already been verified. Available imports include numpy,
+math, collections, itertools, hashlib, and json. np is available without import.
+Use isinstance, type, hasattr, and try/except Exception normally. last_transition
+is an object: use .result and .after_frame, not dictionary subscripting. For
+compact action return values use r[0]['change']; full last_action_result uses
+'change_summary'. Crops return an ascii string; use splitlines() for rows.
+Keep reasoning concise and call
 python promptly.
 """
 
@@ -1663,18 +1692,18 @@ python promptly.
 class PythonToolAgent:
     """OpenAI-compatible tool loop with bounded context eviction."""
 
-    def __init__(self, runtime: PythonToolRuntime) -> None:
+    def __init__(self, runtime: PythonToolRuntime, analyzer_timeout: float = 120.0) -> None:
         self.runtime = runtime
         timeout = httpx.Timeout(
             connect=float(os.getenv("MY_AGENT3_CONNECT_TIMEOUT", "10")),
-            read=float(os.getenv("MY_AGENT3_READ_TIMEOUT", "120")),
+            read=float(os.getenv("MY_AGENT3_READ_TIMEOUT", str(analyzer_timeout))),
             write=float(os.getenv("MY_AGENT3_WRITE_TIMEOUT", "120")),
             pool=float(os.getenv("MY_AGENT3_POOL_TIMEOUT", "10")),
         )
-        self.client = OpenAI(
+        self.client = AsyncOpenAI(
             base_url=os.getenv("LOCAL_ANALYZER_BASE_URL") or os.getenv("OPENAI_BASE_URL") or "http://127.0.0.1:1234/v1",
             api_key=os.getenv("LOCAL_ANALYZER_API_KEY") or os.getenv("OPENAI_API_KEY") or "local",
-            http_client=httpx.Client(timeout=timeout, trust_env=False),
+            http_client=httpx.AsyncClient(timeout=timeout, trust_env=False),
             max_retries=0,
         )
         self.model = os.getenv("INFERENCE_ANALYZER_MODEL") or os.getenv("LOCAL_ANALYZER_MODEL_ID") or "vrfai/Qwen3.6-27B-FP8"
@@ -1683,21 +1712,84 @@ class PythonToolAgent:
         self.max_tool_calls = _env_int("MY_AGENT3_TOOL_CALLS_PER_TURN", 6)
         self.max_tokens = _env_int("MY_AGENT3_MAX_TOKENS", 2048)
         self.forced_tool_choice_supported = True
+        self.context_tokens = _env_int("MY_AGENT3_CONTEXT_TOKENS", 32768)
+        self.context_margin = _env_int("MY_AGENT3_CONTEXT_MARGIN", 512)
+        self.tokenizer_client = httpx.AsyncClient(timeout=10.0, trust_env=False)
+        self.tokenizer_url = str(self.client.base_url).rstrip("/").removesuffix("/v1") + "/tokenize"
+        self.tokenizer_available = True
 
-    def _evict(self, reason: str = "message_limit") -> None:
-        """Keep the system prompt and recent reasoning/tool evidence within the limit."""
-        if len(self.messages) <= self.max_messages:
-            return
-        discarded = len(self.messages) - self.max_messages
-        self.messages = [self.messages[0], *self.messages[-(self.max_messages - 1):]]
-        self.runtime.logger.record(
-            "context_evicted", reason=reason, discarded_messages=discarded,
-            retained_messages=len(self.messages),
-        )
+    async def _prompt_tokens(self) -> int:
+        """Count the server's templated multimodal prompt, or estimate conservatively."""
+        if self.tokenizer_available:
+            try:
+                response = await self.tokenizer_client.post(self.tokenizer_url, json={
+                    "model": self.model, "messages": self.messages, "tools": [PYTHON_TOOL],
+                    "add_generation_prompt": True,
+                    "chat_template_kwargs": {"enable_thinking": True},
+                })
+                response.raise_for_status()
+                payload = response.json()
+                count = int(payload["count"])
+                if count < 0:
+                    raise ValueError("Token count cannot be negative")
+                self.context_tokens = min(self.context_tokens, int(payload["max_model_len"]))
+                return count
+            except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+                self.tokenizer_available = False
+                self.runtime.logger.record("tokenizer_fallback", error=str(exc))
+        # Text bytes deliberately overestimate typical BPE text; image tokens
+        # depend on the model processor. Server context errors still get a bounded retry.
+        estimate = len(json.dumps(PYTHON_TOOL, ensure_ascii=False).encode()) + 256
+        for message in self.messages:
+            compact = dict(message)
+            content = compact.get("content")
+            if isinstance(content, list):
+                compact["content"] = [part for part in content if part.get("type") != "image_url"]
+                estimate += sum(part.get("type") == "image_url" for part in content) * _env_int(
+                    "MY_AGENT3_IMAGE_TOKEN_RESERVE", 4096,
+                )
+            estimate += len(json.dumps(compact, ensure_ascii=False).encode()) + 32
+        return estimate
 
-    def retain_after_inspection(self) -> None:
+    def _drop_context_group(self) -> int:
+        """Drop old state or a complete assistant/tool exchange, keeping the latest state."""
+        users = [i for i, message in enumerate(self.messages) if message["role"] == "user"
+                 and message.get("content") != "Call the python tool now; do not answer in prose."]
+        if len(users) > 1:
+            # Drop history before the latest state one complete turn at a time.
+            stop = users[1]
+            removed = stop - 1
+            del self.messages[1:stop]
+            return removed
+        first = users[0] + 1 if users else 1
+        assistants = [i for i in range(first, len(self.messages)) if self.messages[i]["role"] == "assistant"]
+        if len(assistants) > 1:
+            start, stop = assistants[:2]
+            del self.messages[start:stop]
+            return stop - start
+        return 0
+
+    async def _evict(self, reason: str = "message_limit") -> None:
+        """Reserve output space and evict complete tool exchanges before every request."""
+        discarded = 0
+        prompt_tokens = await self._prompt_tokens()
+        budget = self.context_tokens - self.max_tokens - self.context_margin
+        while len(self.messages) > self.max_messages or prompt_tokens > budget:
+            removed = self._drop_context_group()
+            if not removed:
+                break
+            discarded += removed
+            prompt_tokens = await self._prompt_tokens()
+        if discarded:
+            self.runtime.logger.record(
+                "context_evicted", reason=reason, discarded_messages=discarded,
+                retained_messages=len(self.messages), prompt_tokens=prompt_tokens,
+                input_budget=budget,
+            )
+
+    async def retain_after_inspection(self) -> None:
         """Retry without discarding recent inspection, reasoning, or tool feedback."""
-        self._evict(reason="inspection_retry")
+        await self._evict(reason="inspection_retry")
         self.runtime.logger.record(
             "context_retained", reason="inspection_retry", message_count=len(self.messages),
         )
@@ -1729,10 +1821,11 @@ class PythonToolAgent:
             {"type": "image_url", "image_url": {"url": _image_url(board)}},
         ]}
 
-    def close(self) -> None:
-        self.client.close()
+    async def close(self) -> None:
+        await self.tokenizer_client.aclose()
+        await self.client.close()
 
-    def preflight(self) -> bool:
+    async def preflight(self) -> bool:
         """Verify the multimodal tool protocol without changing game state."""
         timeout = _env_float("MY_AGENT3_PREFLIGHT_TIMEOUT", 45.0, 1.0)
         max_tokens = _env_int("MY_AGENT3_PREFLIGHT_MAX_TOKENS", self.max_tokens)
@@ -1753,7 +1846,7 @@ class PythonToolAgent:
             valid_actions=self.runtime.valid_actions(),
         )
         try:
-            response = self.client.chat.completions.create(
+            response = await self.client.chat.completions.create(
                 model=self.model, messages=messages, tools=[PYTHON_TOOL], tool_choice="required",
                 temperature=0, max_tokens=max_tokens, timeout=timeout,
                 extra_body={"chat_template_kwargs": {"enable_thinking": True}},
@@ -1817,7 +1910,7 @@ class PythonToolAgent:
             )
         return valid_call
 
-    def play_turn(self) -> bool:
+    async def play_turn(self) -> bool:
         """Return whether a real environment action was executed."""
         before = self.runtime.actions_taken
         self.messages.append(self._turn_message())
@@ -1829,11 +1922,14 @@ class PythonToolAgent:
             step=self.runtime.current_frame.step,
             message_count=len(self.messages),
         )
-        self._evict()
-        for _ in range(self.max_tool_calls):
+        await self._evict()
+        context_retries = 0
+        tool_attempts = 0
+        while tool_attempts < self.max_tool_calls:
+            await self._evict(reason="request_budget")
             request_started = time.monotonic()
             try:
-                response = self.client.chat.completions.create(
+                response = await self.client.chat.completions.create(
                     model=self.model, messages=self.messages, tools=[PYTHON_TOOL],
                     tool_choice="required" if self.forced_tool_choice_supported else "auto",
                     temperature=0, max_tokens=self.max_tokens,
@@ -1841,6 +1937,14 @@ class PythonToolAgent:
                 )
             except BadRequestError as exc:
                 detail = str(exc).lower()
+                if any(term in detail for term in ("maximum context length", "context_length_exceeded", "max model len")):
+                    if context_retries < 3 and self._drop_context_group():
+                        context_retries += 1
+                        self.runtime.logger.record(
+                            "context_retry", retry=context_retries, error=str(exc),
+                            retained_messages=len(self.messages),
+                        )
+                        continue
                 if self.forced_tool_choice_supported and (
                     "tool_choice" in detail or "tool choice" in detail
                 ) and any(word in detail for word in ("unsupported", "not supported", "only", "must be")):
@@ -1863,10 +1967,12 @@ class PythonToolAgent:
                     duration_s=round(time.monotonic() - request_started, 3),
                 )
                 break
+            tool_attempts += 1
             message = response.choices[0].message
             calls = list(message.tool_calls or [])
             self.runtime.logger.record(
                 "model_response",
+                finish_reason=response.choices[0].finish_reason,
                 content=message.content,
                 reasoning=(
                     getattr(message, "reasoning", None)
@@ -1907,17 +2013,17 @@ class PythonToolAgent:
                     or self.runtime.game_over()
                     or self.runtime.actions_taken >= self.runtime.max_actions
                 ):
-                    self._evict()
+                    await self._evict()
                     return self.runtime.actions_taken > before
                 if self.runtime.actions_taken > before:
                     action_executed = True
             if action_executed:
-                self._evict(reason="action")
+                await self._evict(reason="action")
                 self.runtime.logger.record(
                     "context_retained", reason="action", message_count=len(self.messages),
                 )
                 return True
-            self._evict()
+            await self._evict()
         return self.runtime.actions_taken > before
 
 
@@ -1928,73 +2034,110 @@ class MyAgent3Solver(Solver):
     label: str = "MyAgent3"
     max_actions_per_game: int = 100
     _preflight_ok: bool | None = field(default=None, init=False, repr=False)
+    _model_failures: list[dict[str, str]] = field(default_factory=list, init=False, repr=False)
+
+    def _record_model_failure(self, game: taaf.game.Game, error: str) -> None:
+        self._model_failures.append({
+            "game_id": str(getattr(game, "game_id", None) or getattr(game, "env_name", "unknown")),
+            "error": error,
+        })
 
     async def _run_games(self, games: list[taaf.game.Game]) -> None:
-        # Inference is synchronous. Running games sequentially prevents one
-        # vLLM request from blocking every supposedly concurrent coroutine.
-        for game in games:
-            await self._play_one(game)
+        self._model_failures.clear()
+        # Only HTTP awaits overlap. Python tools and engine actions stay on the
+        # event-loop thread: redirect_stdout and mutable action enums are not thread-safe.
+        self._preflight_ok = None
+        self._preflight_lock = asyncio.Lock()
+        semaphore = asyncio.Semaphore(max(1, int(self.concurrency)))
+
+        async def play(game: taaf.game.Game) -> None:
+            async with semaphore:
+                await self._play_one(game)
+
+        tasks = [asyncio.create_task(play(game)) for game in games]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _play_until_done(
+        self, runtime: PythonToolRuntime, agent: PythonToolAgent, logger: RunLogger,
+    ) -> None:
+        async with self._preflight_lock:
+            if self._preflight_ok is None:
+                self._preflight_ok = await agent.preflight()
+        if not self._preflight_ok:
+            self._record_model_failure(runtime.game, runtime.last_error or "model preflight failed")
+            logger.record("solver_stopped", reason="model_preflight_failed", error=runtime.last_error)
+            return
+        max_no_action_retries = _env_int("MY_AGENT3_MAX_NO_ACTION_RETRIES", 2)
+        no_action_retries = 0
+        while not runtime.terminal() and runtime.actions_taken < self.max_actions_per_game:
+            if runtime.game_over():
+                if "RESET" not in runtime.valid_actions():
+                    break
+                runtime.action(["RESET"])
+                continue
+            did_act = await agent.play_turn()
+            if did_act:
+                no_action_retries = 0
+                continue
+            if runtime.last_error:
+                self._record_model_failure(runtime.game, runtime.last_error)
+                logger.record(
+                    "solver_stopped", reason="model_error", error=runtime.last_error,
+                    actions_taken=runtime.actions_taken,
+                )
+                break
+            if no_action_retries < max_no_action_retries:
+                no_action_retries += 1
+                logger.record(
+                    "solver_retrying", reason="inspection_only_turn",
+                    retry=no_action_retries, max_retries=max_no_action_retries,
+                    actions_taken=runtime.actions_taken,
+                )
+                await agent.retain_after_inspection()
+                continue
+            logger.record(
+                "solver_stopped", reason="inspection_retry_exhausted",
+                actions_taken=runtime.actions_taken, retries=no_action_retries,
+            )
+            break
 
     async def _play_one(self, game: taaf.game.Game) -> None:
         logger = RunLogger(game)
         runtime = PythonToolRuntime(game, self.max_actions_per_game, logger)
-        agent = PythonToolAgent(runtime)
+        agent = PythonToolAgent(runtime, analyzer_timeout=self.analyzer_timeout)
+        budget = float(self.max_runtime_s_per_game)
         try:
-            if self._preflight_ok is None:
-                self._preflight_ok = agent.preflight()
-            if not self._preflight_ok:
-                logger.record("solver_stopped", reason="model_preflight_failed", error=runtime.last_error)
-                return
-            max_no_action_retries = _env_int("MY_AGENT3_MAX_NO_ACTION_RETRIES", 2)
-            no_action_retries = 0
-            while not runtime.terminal() and runtime.actions_taken < self.max_actions_per_game:
-                await asyncio.sleep(0)
-                if runtime.game_over():
-                    if "RESET" not in runtime.valid_actions():
-                        break
-                    runtime.action(["RESET"])
-                    continue
-                did_act = agent.play_turn()
-                if did_act:
-                    no_action_retries = 0
-                    continue
-                if runtime.last_error:
-                    logger.record(
-                        "solver_stopped", reason="model_error", error=runtime.last_error,
-                        actions_taken=runtime.actions_taken,
-                    )
-                    break
-                if no_action_retries < max_no_action_retries:
-                    no_action_retries += 1
-                    logger.record(
-                        "solver_retrying", reason="inspection_only_turn",
-                        retry=no_action_retries, max_retries=max_no_action_retries,
-                        actions_taken=runtime.actions_taken,
-                    )
-                    agent.retain_after_inspection()
-                    continue
-                logger.record(
-                    "solver_stopped", reason="inspection_retry_exhausted",
-                    actions_taken=runtime.actions_taken, retries=no_action_retries,
-                )
-                break
-            if game.game_run is not None and game.game_run.final_score is None:
-                game.finish_game()
+            async with asyncio.timeout(budget if budget > 0 else None):
+                await self._play_until_done(runtime, agent, logger)
+        except TimeoutError:
+            logger.record(
+                "solver_stopped", reason="runtime_budget_exhausted",
+                actions_taken=runtime.actions_taken, budget_s=budget,
+            )
         except asyncio.CancelledError:
-            if game.game_run is not None and game.game_run.final_score is None:
-                game.finish_game()
+            logger.record("solver_stopped", reason="cancelled", actions_taken=runtime.actions_taken)
             raise
         except Exception as exc:
             print(f"[MYAGENT3 ERROR] {type(exc).__name__}: {exc}", flush=True)
             traceback.print_exc()
+            self._record_model_failure(runtime.game, f"{type(exc).__name__}: {exc}")
             if game.game_run is not None:
                 game.game_run.solver_note = f"{type(exc).__name__}: {exc}"
-                if game.game_run.final_score is None:
-                    with contextlib.suppress(Exception):
-                        game.finish_game()
         finally:
-            agent.close()
-            logger.close()
+            try:
+                if game.game_run is not None and game.game_run.final_score is None:
+                    game.finish_game()
+            finally:
+                try:
+                    await agent.close()
+                finally:
+                    logger.close()
 
 
 # Keep the name used by the older Kaggle cell available when switching files.
