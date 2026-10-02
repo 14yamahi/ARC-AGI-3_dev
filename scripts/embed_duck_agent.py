@@ -33,6 +33,12 @@ print("Custom agent sha256:", ''' + repr(digest) + ''')
 print("Solver:", type(bm.solver).__name__)
 
 '''
+    teardown_source = (root / "scripts/duck_serving_teardown.py").read_text()
+    source += ('# Reviewed wrapper for the pinned serving teardown.\n'
+               'EMBEDDED_TEARDOWN_SOURCE = ' + repr(teardown_source) + '\n'
+               '(Path("/kaggle/working") / "duck_serving_teardown.py").write_text(\n'
+               '    EMBEDDED_TEARDOWN_SOURCE, encoding="utf-8",\n'
+               ')\n\n')
     if '"" if TRUE_SUBMISSION' in old_source:
         source += '''# Keep complete development traces in files without flooding notebook output.
 os.environ["MY_AGENT3_LOG_DIR"] = "" if TRUE_SUBMISSION else "/kaggle/working/my_agent3_logs"
@@ -53,10 +59,12 @@ os.environ["MY_AGENT3_LOG_STDOUT"] = "1"
             "Solver scheduling and validation behavior are documented with the fix branch.\n"
         ).splitlines(keepends=True)
     for code_cell in notebook["cells"]:
+        code_cell.get("metadata", {}).pop("papermill", None)
         if code_cell["cell_type"] == "code":
             code_cell["execution_count"] = None
             code_cell["outputs"] = []
             code_cell.get("metadata", {}).pop("execution", None)
+    notebook.get("metadata", {}).pop("papermill", None)
     path.write_text(json.dumps(notebook, ensure_ascii=False, indent=1) + "\n")
     return digest
 

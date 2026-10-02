@@ -86,11 +86,13 @@ async def test_preflight_runs_once_and_timeouts_finalize_games_and_close_clients
         return result
     def runtime(game, cap, logger):
         return SimpleNamespace(game=game, actions_taken=0, last_error=None,
-                               terminal=lambda: False, game_over=lambda: False)
+                               terminal=lambda: False, game_over=lambda: False,
+                               pending_generated_tokens=0, pending_uncached_input_tokens=0,
+                               generated_tokens=0, uncached_input_tokens=0, responses_without_usage=0)
     games = []
     for i in range(3):
         game = SimpleNamespace(game_run=SimpleNamespace(final_score=None))
-        def finish(game=game):
+        def finish(game=game, **usage):
             game.game_run.final_score = 0
         game.finish_game = finish
         games.append(game)

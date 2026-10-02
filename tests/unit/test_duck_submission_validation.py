@@ -1,5 +1,6 @@
 import ast
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -78,7 +79,7 @@ async def test_failed_benchmark_does_not_create_placeholder_and_still_stops_watc
     watchdog = SimpleNamespace(stop_background=Mock())
     ns = {'bm': SimpleNamespace(run=play, _save_json=Mock(), solver=SimpleNamespace(_model_failures=[{'error': 'HTTP 400'}])),
           'soft_end': None, 'target': None, 'TRUE_SUBMISSION': False, 'WORKING_DIR': tmp_path,
-          'BUNDLE_DIR': tmp_path, 'json': json, 'vllm_watchdog': watchdog}
+          'BUNDLE_DIR': tmp_path, 'json': json, 'vllm_watchdog': watchdog, 'sys': sys}
     code = compile(ast.Module(body=[execution], type_ignores=[]), '<benchmark>', 'exec', flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
     with pytest.raises(RuntimeError, match='Model failures'):
         await eval(code, ns)

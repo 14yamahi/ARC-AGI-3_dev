@@ -18,7 +18,7 @@ def runtime():
         game_run=SimpleNamespace(state="playing", final_score=None),
     )
     game.calls = []
-    def execute(action):
+    def execute(action, **usage):
         game.calls.append(action)
         board[action.data.get("y", 0), action.data.get("x", 0)] = 1
     game.execute_action = execute

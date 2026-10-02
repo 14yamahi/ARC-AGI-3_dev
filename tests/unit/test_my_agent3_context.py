@@ -35,7 +35,7 @@ def agent():
     runtime = SimpleNamespace(logger=MemoryLogger(), actions_taken=0, max_actions=10,
                               current_frame=SimpleNamespace(level=0, step=None), last_error=None,
                               valid_actions=lambda: ["ACTION1"], terminal=lambda: False,
-                              game_over=lambda: False)
+                              game_over=lambda: False, record_usage=Mock())
     value = M.PythonToolAgent(runtime)
     value.tokenizer_available = False
     yield value

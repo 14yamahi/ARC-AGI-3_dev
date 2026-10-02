@@ -16,6 +16,11 @@ Every fix notebook embeds its checkout's my_agent3.py and prints a SHA-256 ident
 
 ## Next Kaggle check
 
+The [runtime follow-up](runtime-followup.md) updates cleanup gating, inspection
+retry recovery, and token accounting after the October 2 ls20 run. Its original
+executed notebook is preserved under `run-evidence/`. The current notebook embeds
+both the solver and the reviewed teardown wrapper.
+
 1. Upload the combined branch's duck-qwen3-8-flash-next-nvfp4-mtp.ipynb. Keep the same working input attachments and GPU selection as the reviewed run.
 2. Use a fresh session. Offline selection defaults to ls20. Expect OFFLINE_SELECTION games=1 with ls20-9607627b, an embedded agent SHA-256, BENCHMARK_COMPLETE, and OFFLINE_AUDIT runs=1. Inspect my_agent3_logs for model errors, tokenizer fallback, or repeated tool errors.
 3. Confirm score.json, offline_validation.json, and submission.parquet exist and the Save & Run completes. A zero score proves only execution.

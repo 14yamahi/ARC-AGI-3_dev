@@ -69,6 +69,14 @@ PYTHON_TOOL = {
     },
 }
 
+INSPECTION_RECOVERY_PROMPT = (
+    "The last turn produced no game action. Use the inspection and tool-error "
+    "feedback already above to choose one legal action that tests a hypothesis. "
+    "If prediction_ledger.replan_required is true, call replan with the updated "
+    "interpretation first. For a previously tested action, call predict before "
+    "action. Call python with that action now; avoid repeating inspections."
+)
+
 
 def _env_int(name: str, default: int, minimum: int = 1) -> int:
     try:
@@ -1209,6 +1217,11 @@ class PythonToolRuntime:
         self.logger = logger
         self.max_actions = max_actions
         self.actions_taken = 0
+        self.pending_generated_tokens = 0
+        self.pending_uncached_input_tokens = 0
+        self.generated_tokens = 0
+        self.uncached_input_tokens = 0
+        self.responses_without_usage = 0
         self.history: list[TransitionView] = []
         self.motion_hypotheses = MotionHypothesisTracker()
         self.edge_signals = EdgeSignalTracker()
@@ -1222,6 +1235,22 @@ class PythonToolRuntime:
         self.last_action_result: dict[str, Any] = {}
         self.last_error: str | None = None
         self.logger.board("initial_board", self.current_frame)
+
+    def record_usage(self, usage: Any) -> None:
+        """Accumulate successful requests until the next action or game finish."""
+        if usage is None:
+            self.responses_without_usage += 1
+            self.logger.record("model_usage_missing")
+            return
+        generated = max(0, int(usage.completion_tokens or 0))
+        prompt = max(0, int(usage.prompt_tokens or 0))
+        details = getattr(usage, "prompt_tokens_details", None)
+        cached = max(0, int(getattr(details, "cached_tokens", 0) or 0))
+        uncached = max(0, prompt - cached)
+        self.pending_generated_tokens += generated
+        self.pending_uncached_input_tokens += uncached
+        self.generated_tokens += generated
+        self.uncached_input_tokens += uncached
 
     def _frame_view(self, board: np.ndarray | None = None) -> FrameView:
         state = self.game.current_state
@@ -1404,7 +1433,14 @@ class PythonToolRuntime:
                     "predict('ACTION_NAME', expected) before repeating it"
                 )
             self.logger.record("action_requested", action=action.name, data=data)
-            self.game.execute_action(arcengine.ActionInput(id=action, data=data))
+            self.game.execute_action(
+                arcengine.ActionInput(id=action, data=data),
+                generated_tokens=self.pending_generated_tokens,
+                uncached_input_tokens=self.pending_uncached_input_tokens,
+            )
+            # Failed actions leave costs pending; each successful action consumes them once.
+            self.pending_generated_tokens = 0
+            self.pending_uncached_input_tokens = 0
             self.actions_taken += 1
             self.previous_frame = before
             after_board = _board_from_state(self.game.current_state)
@@ -1717,6 +1753,7 @@ class PythonToolAgent:
         self.tokenizer_client = httpx.AsyncClient(timeout=10.0, trust_env=False)
         self.tokenizer_url = str(self.client.base_url).rstrip("/").removesuffix("/v1") + "/tokenize"
         self.tokenizer_available = True
+        self._state_actions: int | None = None
 
     async def _prompt_tokens(self) -> int:
         """Count the server's templated multimodal prompt, or estimate conservatively."""
@@ -1754,7 +1791,8 @@ class PythonToolAgent:
     def _drop_context_group(self) -> int:
         """Drop old state or a complete assistant/tool exchange, keeping the latest state."""
         users = [i for i, message in enumerate(self.messages) if message["role"] == "user"
-                 and message.get("content") != "Call the python tool now; do not answer in prose."]
+                 and message.get("content") != "Call the python tool now; do not answer in prose."
+                 and message.get("content") != INSPECTION_RECOVERY_PROMPT]
         if len(users) > 1:
             # Drop history before the latest state one complete turn at a time.
             stop = users[1]
@@ -1789,6 +1827,7 @@ class PythonToolAgent:
 
     async def retain_after_inspection(self) -> None:
         """Retry without discarding recent inspection, reasoning, or tool feedback."""
+        self.messages.append({"role": "user", "content": INSPECTION_RECOVERY_PROMPT})
         await self._evict(reason="inspection_retry")
         self.runtime.logger.record(
             "context_retained", reason="inspection_retry", message_count=len(self.messages),
@@ -1860,6 +1899,7 @@ class PythonToolAgent:
             return False
 
         choices = list(getattr(response, "choices", []) or [])
+        self.runtime.record_usage(getattr(response, "usage", None))
         choice = choices[0] if choices else None
         message = choice.message if choice else None
         calls = list(getattr(message, "tool_calls", None) or [])
@@ -1913,7 +1953,11 @@ class PythonToolAgent:
     async def play_turn(self) -> bool:
         """Return whether a real environment action was executed."""
         before = self.runtime.actions_taken
-        self.messages.append(self._turn_message())
+        # A retry on the same board must retain its inspection/tool exchanges.
+        # Adding a duplicate state here makes eviction discard that evidence.
+        if self._state_actions != before:
+            self.messages.append(self._turn_message())
+            self._state_actions = before
         self.runtime.logger.record(
             "model_request",
             model=self.model,
@@ -1968,6 +2012,7 @@ class PythonToolAgent:
                 )
                 break
             tool_attempts += 1
+            self.runtime.record_usage(getattr(response, "usage", None))
             message = response.choices[0].message
             calls = list(message.tool_calls or [])
             self.runtime.logger.record(
@@ -2065,20 +2110,20 @@ class MyAgent3Solver(Solver):
 
     async def _play_until_done(
         self, runtime: PythonToolRuntime, agent: PythonToolAgent, logger: RunLogger,
-    ) -> None:
+    ) -> str:
         async with self._preflight_lock:
             if self._preflight_ok is None:
                 self._preflight_ok = await agent.preflight()
         if not self._preflight_ok:
             self._record_model_failure(runtime.game, runtime.last_error or "model preflight failed")
             logger.record("solver_stopped", reason="model_preflight_failed", error=runtime.last_error)
-            return
-        max_no_action_retries = _env_int("MY_AGENT3_MAX_NO_ACTION_RETRIES", 2)
+            return "model_preflight_failed"
+        max_no_action_retries = _env_int("MY_AGENT3_MAX_NO_ACTION_RETRIES", 4, 0)
         no_action_retries = 0
         while not runtime.terminal() and runtime.actions_taken < self.max_actions_per_game:
             if runtime.game_over():
                 if "RESET" not in runtime.valid_actions():
-                    break
+                    return "game_over_without_reset"
                 runtime.action(["RESET"])
                 continue
             did_act = await agent.play_turn()
@@ -2091,7 +2136,7 @@ class MyAgent3Solver(Solver):
                     "solver_stopped", reason="model_error", error=runtime.last_error,
                     actions_taken=runtime.actions_taken,
                 )
-                break
+                return "model_error"
             if no_action_retries < max_no_action_retries:
                 no_action_retries += 1
                 logger.record(
@@ -2105,25 +2150,35 @@ class MyAgent3Solver(Solver):
                 "solver_stopped", reason="inspection_retry_exhausted",
                 actions_taken=runtime.actions_taken, retries=no_action_retries,
             )
-            break
+            self._record_model_failure(
+                runtime.game,
+                "inspection_retry_exhausted: model did not execute an action after "
+                f"{no_action_retries} recovery retries",
+            )
+            return "inspection_retry_exhausted"
+        return "action_budget_exhausted" if runtime.actions_taken >= self.max_actions_per_game else "terminal"
 
     async def _play_one(self, game: taaf.game.Game) -> None:
         logger = RunLogger(game)
         runtime = PythonToolRuntime(game, self.max_actions_per_game, logger)
         agent = PythonToolAgent(runtime, analyzer_timeout=self.analyzer_timeout)
         budget = float(self.max_runtime_s_per_game)
+        stop_reason = "unknown"
         try:
             async with asyncio.timeout(budget if budget > 0 else None):
-                await self._play_until_done(runtime, agent, logger)
+                stop_reason = await self._play_until_done(runtime, agent, logger)
         except TimeoutError:
+            stop_reason = "runtime_budget_exhausted"
             logger.record(
                 "solver_stopped", reason="runtime_budget_exhausted",
                 actions_taken=runtime.actions_taken, budget_s=budget,
             )
         except asyncio.CancelledError:
+            stop_reason = "cancelled"
             logger.record("solver_stopped", reason="cancelled", actions_taken=runtime.actions_taken)
             raise
         except Exception as exc:
+            stop_reason = "solver_exception"
             print(f"[MYAGENT3 ERROR] {type(exc).__name__}: {exc}", flush=True)
             traceback.print_exc()
             self._record_model_failure(runtime.game, f"{type(exc).__name__}: {exc}")
@@ -2132,11 +2187,24 @@ class MyAgent3Solver(Solver):
         finally:
             try:
                 if game.game_run is not None and game.game_run.final_score is None:
-                    game.finish_game()
+                    game.finish_game(
+                        generated_tokens=runtime.pending_generated_tokens,
+                        uncached_input_tokens=runtime.pending_uncached_input_tokens,
+                    )
             finally:
                 try:
                     await agent.close()
                 finally:
+                    summary = {
+                        "game_id": str(getattr(game, "game_id", None) or getattr(game, "env_name", "unknown")),
+                        "reason": stop_reason, "actions_taken": runtime.actions_taken,
+                        "action_budget": self.max_actions_per_game,
+                        "generated_tokens": runtime.generated_tokens,
+                        "uncached_input_tokens": runtime.uncached_input_tokens,
+                        "responses_without_usage": runtime.responses_without_usage,
+                    }
+                    logger.record("solver_summary", **summary)
+                    print("MYAGENT3_STOP " + json.dumps(summary, sort_keys=True), flush=True)
                     logger.close()
 
 
